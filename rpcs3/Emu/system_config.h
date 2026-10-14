@@ -341,7 +341,7 @@ struct cfg_root : cfg::node
 	{
 		node_net(cfg::node* _this) : cfg::node(_this, "Net") {}
 
-		cfg::_enum<np_internet_status> net_active{this, "Internet enabled", np_internet_status::disabled};
+		cfg::_enum<np_internet_status> net_active{this, "Internet enabled", np_internet_status::enabled}; // Pier: always connected
 		cfg::string ip_address{this, "IP address", "0.0.0.0"};
 		cfg::string bind_address{this, "Bind address", "0.0.0.0"};
 		cfg::string dns{this, "DNS address", "8.8.8.8"};

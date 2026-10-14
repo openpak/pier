@@ -452,12 +452,24 @@ namespace np
 		if (get_net_status() == CELL_NET_CTL_STATE_IPObtained)
 		{
 
-			if (!discover_ether_address() || !discover_ip_address())
+			// Pier: the console always reports a wired link, wherever the host runs.
+			// When the host has no usable interface or route, fall back to a fixed
+			// private address and a MAC derived from the PSID instead of going offline.
+			if (!discover_ether_address())
 			{
-				nph_log.error("Failed to discover ethernet or ip address!");
-				is_connected  = false;
-				is_psn_active = false;
-				return;
+				nph_log.warning("No host ethernet address found, deriving one from the PSID");
+				const u128 psid = g_cfg.sys.console_psid;
+				std::memcpy(ether_address.data(), &psid, 6);
+				ether_address[0] &= 0xFE;
+				ether_address[0] |= 0x02;
+			}
+
+			if (!discover_ip_address())
+			{
+				nph_log.warning("No host route found, using the fallback address 192.168.1.2");
+				in_addr fallback{};
+				inet_pton(AF_INET, "192.168.1.2", &fallback);
+				local_ip_addr = fallback.s_addr;
 			}
 
 			// Convert dns address
