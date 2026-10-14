@@ -452,9 +452,9 @@ namespace np
 		if (get_net_status() == CELL_NET_CTL_STATE_IPObtained)
 		{
 
-			// Pier: the console always reports a wired link, wherever the host runs.
-			// When the host has no usable interface or route, fall back to a fixed
-			// private address and a MAC derived from the PSID instead of going offline.
+			// Pier: the console reports a wired link whenever the host has a route, whatever the host
+			// interface really is (Wi-Fi, phone, VPN). A host with no route stays offline.
+			// A host without a readable ethernet address (Wi-Fi only, sandboxed) gets one derived from the PSID.
 			if (!discover_ether_address())
 			{
 				nph_log.warning("No host ethernet address found, deriving one from the PSID");
@@ -466,10 +466,10 @@ namespace np
 
 			if (!discover_ip_address())
 			{
-				nph_log.warning("No host route found, using the fallback address 192.168.1.2");
-				in_addr fallback{};
-				inet_pton(AF_INET, "192.168.1.2", &fallback);
-				local_ip_addr = fallback.s_addr;
+				nph_log.error("No host route found, the console stays offline");
+				is_connected  = false;
+				is_psn_active = false;
+				return;
 			}
 
 			// Convert dns address

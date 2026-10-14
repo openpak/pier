@@ -6,6 +6,7 @@
 #include "Utilities/Thread.h"
 
 #include "sys_sync.h"
+#include "sys_event.h"
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -30,6 +31,7 @@
 #endif
 
 #include "Emu/NP/np_handler.h"
+#include "Emu/Cell/Modules/cellNetCtl.h"
 #include "Emu/NP/np_helpers.h"
 #include "Emu/Cell/timers.hpp"
 #include "Emu/system_config.h"
@@ -1139,12 +1141,21 @@ error_code sys_net_bnet_setsockopt(ppu_thread& ppu, s32 s, s32 level, s32 optnam
 		break;
 	}
 
-	if (optlen < sizeof(s32))
+	// Pier: BSD takes IP_MULTICAST_TTL / IP_MULTICAST_LOOP as a single byte; the firmware's DHCP client does so
+	const bool byte_option = optlen == 1 && level == SYS_NET_IPPROTO_IP && (optname == SYS_NET_IP_MULTICAST_TTL || optname == SYS_NET_IP_MULTICAST_LOOP);
+
+	if (optlen < sizeof(s32) && !byte_option)
 	{
 		return -SYS_NET_EINVAL;
 	}
 
 	std::vector<u8> optval_copy(vm::_ptr<u8>(optval.addr()), vm::_ptr<u8>(optval.addr() + optlen));
+
+	if (byte_option)
+	{
+		// Widen to the big-endian s32 the sockets read
+		optval_copy = {0, 0, 0, optval_copy[0]};
+	}
 
 	const auto sock = idm::check<lv2_socket>(s, [&, notify = lv2_obj::notify_all_t()](lv2_socket& sock) -> s32
 		{
@@ -1202,6 +1213,14 @@ error_code sys_net_bnet_socket(ppu_thread& ppu, lv2_socket_family family, lv2_so
 	if (family != SYS_NET_AF_INET)
 	{
 		sys_net.error("sys_net_bnet_socket(): unknown family (%d)", family);
+	}
+
+	// Pier: the firmware's DHCP client also opens socket(AF_INET, 7, 0) next to its UDP socket. Only ioctl()s are
+	// issued on it (and it is polled, never readable), so the inert raw socket is enough.
+	if (static_cast<s32>(type) == 7)
+	{
+		sys_net.notice("sys_net_bnet_socket(): type 7 served by a raw stub");
+		type = SYS_NET_SOCK_RAW;
 	}
 
 	if (type != SYS_NET_SOCK_STREAM && type != SYS_NET_SOCK_DGRAM && type != SYS_NET_SOCK_RAW && type != SYS_NET_SOCK_DGRAM_P2P && type != SYS_NET_SOCK_STREAM_P2P)
@@ -1908,6 +1927,12 @@ static void net_write_sockinfo(s32 s, lv2_socket& sock, sys_net_sockinfo_t& info
 	sys_net.trace("sys_net_infoctl(cmd=6): %s", info);
 }
 
+// Pier: link events of the wired port, defined with the other eth0 emulation below
+static error_code net_infoctl_link_events(s32 cmd, vm::ptr<void> arg);
+
+// Pier: id of the event queue the firmware's ntm thread registered with sys_net_infoctl(55) (0 = none). sys_event.cpp logs traffic on it.
+atomic_t<u32> g_pier_ntm_queue{0};
+
 error_code sys_net_infoctl(ppu_thread& ppu, s32 cmd, vm::ptr<void> arg)
 {
 	ppu.state += cpu_flag::wait;
@@ -1997,6 +2022,11 @@ error_code sys_net_infoctl(ppu_thread& ppu, s32 cmd, vm::ptr<void> arg)
 		std::memcpy(cmd_arg->server_name.get_ptr(), nameserver.c_str(), nameserver.size() + 1);
 		break;
 	}
+	case 55: // Pier: (name, event queue id, event data) register for link events of an interface
+	case 56: // Pier: (name) unregister
+	{
+		return net_infoctl_link_events(cmd, arg);
+	}
 	default: break;
 	}
 
@@ -2035,9 +2065,29 @@ namespace
 	atomic_t<u16> g_net_eth0_flags{static_cast<u16>(net_iff_broadcast | net_iff_simplex | net_iff_multicast)}; // administratively down
 	atomic_t<u32> g_net_eth0_mode{0};
 
+	// ifaddr state of eth0, as assigned by the firmware with SIOCSIFADDR/SIOCSIFNETMASK/SIOCSIFBRDADDR/SIOCAIFADDR
+	// (network byte order, 0 = none). It feeds SIOCGIFADDR... and the NET_RT_IFLIST reply (getifaddrs).
+	atomic_t<u32> g_net_eth0_ip{0};
+	atomic_t<u32> g_net_eth0_mask{0};
+	atomic_t<u32> g_net_eth0_brd{0};
+
+	// Link event registration made with sys_net_infoctl(55, ...)
+	atomic_t<u32> g_net_eth0_evq{0};
+	atomic_t<u64> g_net_eth0_evdata{0};
+
+	constexpr u32 net_siocsifaddr    = 0x8020690c;
+	constexpr u32 net_siocsifbrdaddr = 0x80206913;
+	constexpr u32 net_siocsifnetmask = 0x80206916;
+	constexpr u32 net_siocdifaddr    = 0x80206919;
+	constexpr u32 net_siocaifaddr    = 0x8040691a;
+	constexpr u32 net_siocgifaddr    = 0xc0206921;
+	constexpr u32 net_siocgifbrdaddr = 0xc0206923;
+	constexpr u32 net_siocgifnetmask = 0xc0206925;
+
 	bool net_link_is_up()
 	{
-		return g_cfg.net.net_active == np_internet_status::enabled;
+		// The link follows the host: enabled in settings AND the host has a route (np_handler found an IP)
+		return g_cfg.net.net_active == np_internet_status::enabled && g_fxo->get<named_thread<np::np_handler>>().get_net_status() == CELL_NET_CTL_STATE_IPObtained;
 	}
 
 	bool net_ifname_is_wired(u32 addr)
@@ -2050,6 +2100,158 @@ namespace
 	{
 		return addr && vm::check_addr(addr, flags, size) ? vm::get_super_ptr<u8>(addr) : nullptr;
 	}
+
+	// "Link up" event of the wired port: sys_event {source 0, data1 = value given at registration,
+	// data2 = 4 (link up; 8 = link down), data3 = negotiated mode}. VSH's ntm thread waits for it before it
+	// starts DHCP (VSH 0x32914c wired branch, 0x33a094 wait loop).
+	void net_post_link_event()
+	{
+		const u32 qid = g_net_eth0_evq;
+
+		if (!qid || !net_link_is_up())
+		{
+			return;
+		}
+
+		if (const auto queue = idm::get_unlocked<lv2_obj, lv2_event_queue>(qid))
+		{
+			lv2_obj::notify_all_t notify;
+			const u32 err = static_cast<u32>(queue->send(0, g_net_eth0_evdata, 4, net_link_1000_full));
+			sys_net.notice("eth0 link-up event sent to queue 0x%x (data1=0x%llx): %s", qid, g_net_eth0_evdata.load(), err ? "FAILED" : "ok");
+		}
+		else
+		{
+			sys_net.error("eth0 link-up event: event queue 0x%x does not exist", qid);
+		}
+	}
+
+	// Pier workaround/diagnostic. The firmware's DHCP client tells the ntm thread "address bound" with an event
+	// (data1 = 0x10, posted from its callback at vsh 0x32b60c) and the ntm thread (blocked in vsh 0x32a170 with
+	// mask 570 from 0x32aff8) then continues with state 5 (vsh 0x32a964: ioctl 0xc020697e, SIOCGIFADDR, route dump).
+	// In every run so far that continuation never started. Post the same event once the address and netmask have
+	// been applied (the last ioctls before the client's own notification). If the client's own event arrives
+	// too it is ignored (state 5 waits with a mask without 0x10).
+	void net_post_ntm_bound_event()
+	{
+		const u32 qid = g_net_eth0_evq;
+
+		if (!qid || !g_net_eth0_ip || !g_net_eth0_mask || !net_link_is_up())
+		{
+			return;
+		}
+
+		if (const auto queue = idm::get_unlocked<lv2_obj, lv2_event_queue>(qid))
+		{
+			lv2_obj::notify_all_t notify;
+			const u32 err = static_cast<u32>(queue->send(0, 0x10, 0, 0));
+			sys_net.notice("eth0 address applied: bound event 0x10 posted to ntm queue 0x%x: %s", qid, err ? "FAILED" : "ok");
+		}
+	}
+
+	void net_put16(std::vector<u8>& v, usz off, u32 x)
+	{
+		v[off] = static_cast<u8>(x >> 8);
+		v[off + 1] = static_cast<u8>(x);
+	}
+
+	void net_put32(std::vector<u8>& v, usz off, u32 x)
+	{
+		net_put16(v, off, x >> 16);
+		net_put16(v, off + 2, x & 0xffff);
+	}
+
+	// NET_RT_IFLIST reply (mib {CTL_NET, PF_ROUTE, 0, 0, NET_RT_IFLIST, 0}) as parsed by libnet's getifaddrs
+	// (VSH 0x25f78): RTM_IFINFO (version 3, type 15) for eth0 with its sockaddr_dl, followed by RTM_NEWADDR
+	// (type 12) once an address has been assigned. if_nametoindex("eth0") (VSH 0x13728, needed by the DHCP
+	// client) walks exactly this list.
+	std::vector<u8> net_build_iflist()
+	{
+		const auto& mac = g_fxo->get<named_thread<np::np_handler>>().get_ether_addr();
+		const u32 ip = g_net_eth0_ip;
+		const bool up = (g_net_eth0_flags & net_iff_up) != 0;
+
+		std::vector<u8> out(172); // 152 header + roundup4(sizeof sockaddr_dl 18)
+		net_put16(out, 0, 172);
+		out[2] = 3;  // RTM_VERSION
+		out[3] = 15; // RTM_IFINFO
+		net_put32(out, 4, 0x10); // RTA_IFP: the parser skips messages without it
+		net_put32(out, 8, net_iff_broadcast | net_iff_simplex | net_iff_multicast | (up ? net_iff_up | net_iff_running : 0));
+		net_put16(out, 12, 1); // ifindex
+		out[16] = 6;  // if_data.ifi_type = IFT_ETHER (contents are copied, not interpreted)
+		out[17] = 6;  // ifi_addrlen
+		out[18] = 14; // ifi_hdrlen
+		out[152] = 18; // sdl_len
+		out[153] = 18; // sdl_family = AF_LINK
+		net_put16(out, 154, 1); // sdl_index
+		out[156] = 6; // sdl_type
+		out[157] = 4; // sdl_nlen
+		out[158] = 6; // sdl_alen
+		std::memcpy(&out[160], "eth0", 4);
+		std::memcpy(&out[164], mac.data(), 6);
+
+		if (ip)
+		{
+			const usz base = out.size();
+			out.resize(base + 20 + 3 * 16);
+			net_put16(out, base, 20 + 3 * 16);
+			out[base + 2] = 3;  // RTM_VERSION
+			out[base + 3] = 12; // RTM_NEWADDR
+			net_put32(out, base + 4, 0x04 | 0x20 | 0x80); // RTA_NETMASK | RTA_IFA | RTA_BRD, sockaddrs follow in this order
+			net_put16(out, base + 12, 1); // ifindex of the IFINFO above
+
+			const u32 sa[3] = {g_net_eth0_mask, ip, g_net_eth0_brd};
+
+			for (usz i = 0; i < 3; i++)
+			{
+				const usz o = base + 20 + i * 16;
+				out[o] = 16;     // sin_len
+				out[o + 1] = 2;  // AF_INET
+				std::memcpy(&out[o + 4], &sa[i], 4);
+			}
+		}
+
+		return out;
+	}
+}
+
+static error_code net_infoctl_link_events(s32 cmd, vm::ptr<void> arg)
+{
+	if (!arg)
+	{
+		return -SYS_NET_EINVAL;
+	}
+
+	// 32 byte block built by the user library: be64 @0 = queue id, be64 @8 = event data, be32 @20 = name pointer
+	const u8* const blk = net_guest_buf(arg.addr(), 32, vm::page_readable);
+
+	if (!blk)
+	{
+		return -SYS_NET_EFAULT;
+	}
+
+	const u32 name_addr = static_cast<u32>(*reinterpret_cast<const be_t<u64>*>(blk + 16));
+
+	if (!net_ifname_is_wired(name_addr))
+	{
+		return CELL_OK; // eth1 (WLAN) and friends never get link events
+	}
+
+	sys_net.notice("sys_net_infoctl(%d): eth0 link events %s", cmd, cmd == 56 ? "unregistered" : "registered");
+
+	if (cmd == 56)
+	{
+		g_net_eth0_evq = 0;
+		return CELL_OK;
+	}
+
+	g_net_eth0_evdata = *reinterpret_cast<const be_t<u64>*>(blk + 8);
+	g_net_eth0_evq = static_cast<u32>(*reinterpret_cast<const be_t<u64>*>(blk));
+	g_pier_ntm_queue = g_net_eth0_evq.load();
+
+	// A real PHY reports "link up" a moment after the interface goes up. Report it right away: one event per
+	// registration, the connect step of the firmware is blocked on it (see ipobtain.md)
+	net_post_link_event();
+	return CELL_OK;
 }
 
 error_code sys_net_control(ppu_thread& ppu, u32 arg1, s32 arg2, vm::ptr<void> arg3, s32 arg4)
@@ -2097,6 +2299,84 @@ error_code sys_net_bnet_ioctl(ppu_thread& ppu, s32 arg1, u32 arg2, vm::ptr<void>
 
 	switch (arg2)
 	{
+	case net_siocsifaddr:
+	case net_siocsifbrdaddr:
+	case net_siocsifnetmask:
+	case net_siocdifaddr:
+	case net_siocaifaddr:
+	case net_siocgifaddr:
+	case net_siocgifbrdaddr:
+	case net_siocgifnetmask:
+	{
+		// struct ifreq { name[16]; sockaddr_in { len, family, port, addr @ +20 } }
+		// struct ifaliasreq { name[16]; addr @ +16 (sockaddr_in); broadaddr @ +32; mask @ +48 }
+		u8* const ifr = net_guest_buf(arg3.addr(), arg2 == net_siocaifaddr ? 0x40 : 0x20, vm::page_writable);
+
+		if (!ifr)
+		{
+			return -SYS_NET_EFAULT;
+		}
+
+		if (!net_ifname_is_wired(arg3.addr()))
+		{
+			break; // lo0, eth1, ...
+		}
+
+		const auto sa_addr = [&](usz sockaddr_off) -> u32
+		{
+			u32 v;
+			std::memcpy(&v, ifr + sockaddr_off + 4, 4);
+			return v;
+		};
+
+		if (arg2 != net_siocgifaddr && arg2 != net_siocgifbrdaddr && arg2 != net_siocgifnetmask)
+		{
+			sys_net.notice("eth0 ioctl 0x%x: addr=%s mask=%s brd=%s", arg2, np::ip_to_string(arg2 == net_siocaifaddr || arg2 == net_siocsifaddr ? sa_addr(16) : g_net_eth0_ip.load()), np::ip_to_string(arg2 == net_siocaifaddr ? sa_addr(48) : arg2 == net_siocsifnetmask ? sa_addr(16) : g_net_eth0_mask.load()), np::ip_to_string(arg2 == net_siocaifaddr ? sa_addr(32) : arg2 == net_siocsifbrdaddr ? sa_addr(16) : g_net_eth0_brd.load()));
+		}
+
+		switch (arg2)
+		{
+		case net_siocsifaddr: g_net_eth0_ip = sa_addr(16); break;
+		case net_siocsifbrdaddr: g_net_eth0_brd = sa_addr(16); break;
+		case net_siocsifnetmask:
+		{
+			g_net_eth0_mask = sa_addr(16);
+			net_post_ntm_bound_event();
+			break;
+		}
+		case net_siocaifaddr:
+		{
+			g_net_eth0_ip = sa_addr(16);
+			g_net_eth0_brd = sa_addr(32);
+			g_net_eth0_mask = sa_addr(48);
+			break;
+		}
+		case net_siocdifaddr:
+		{
+			g_net_eth0_ip = 0;
+			g_net_eth0_brd = 0;
+			g_net_eth0_mask = 0;
+			break;
+		}
+		default:
+		{
+			const u32 v = arg2 == net_siocgifaddr ? g_net_eth0_ip.load() : arg2 == net_siocgifnetmask ? g_net_eth0_mask.load() : g_net_eth0_brd.load();
+
+			if (!v)
+			{
+				return -SYS_NET_EADDRNOTAVAIL;
+			}
+
+			std::memset(ifr + 16, 0, 16);
+			ifr[16] = 16; // sin_len
+			ifr[17] = 2;  // AF_INET
+			std::memcpy(ifr + 20, &v, 4);
+			break;
+		}
+		}
+
+		return CELL_OK;
+	}
 	case net_siocgifflags:
 	case net_siocsifflags:
 	case net_siocgiflladdr:
@@ -2151,8 +2431,35 @@ error_code sys_net_bnet_sysctl(ppu_thread& ppu, vm::cptr<s32> name, u32 namelen,
 		return CELL_OK;
 	}
 
-	// ponytail: every table is empty. VSH reads *oldlenp back and mallocs that many bytes, so it must be
-	// written. NET_RT_IFLIST (interface list) is modelled in analysis/netlink.md if a later screen needs it.
+	// mib {CTL_NET = 4, PF_ROUTE = 17, 0, af, op, 0}: op 4 = NET_RT_IFLIST (getifaddrs, if_nametoindex), op 1 = NET_RT_DUMP
+	if (name && namelen == 6 && name[0] == 4 && name[1] == 17 && name[4] == 4)
+	{
+		const std::vector<u8> list = net_build_iflist();
+
+		// Two-step protocol: oldp == 0 asks for the size, the second call has a buffer of that size
+		if (oldp)
+		{
+			if (*oldlenp < list.size())
+			{
+				*oldlenp = list.size();
+				return -SYS_NET_ENOSPC;
+			}
+
+			u8* const dst = net_guest_buf(oldp.addr(), ::size32(list), vm::page_writable);
+
+			if (!dst)
+			{
+				return -SYS_NET_EFAULT;
+			}
+
+			std::memcpy(dst, list.data(), list.size());
+		}
+
+		*oldlenp = list.size();
+		return CELL_OK;
+	}
+
+	// Every other table (route/ARP dump, ...) is empty. VSH reads *oldlenp back and mallocs that many bytes.
 	sys_net.todo("sys_net_bnet_sysctl(name=*0x%x, namelen=%d, oldp=*0x%x, oldlenp=*0x%x, newp=*0x%x, newlen=0x%x)", name, namelen, oldp, oldlenp, newp, newlen);
 	*oldlenp = 0;
 	return CELL_OK;

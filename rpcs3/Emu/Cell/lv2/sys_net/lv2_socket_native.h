@@ -77,5 +77,6 @@ private:
 	s32 max_ttl = 64;
 
 	u16 bound_port = 0;
+	bool dhcp_client = false; // Pier: guest bound port 68, it is served by the emulated DHCP server (see net_dhcp_serve)
 	bool feign_tcp_conn_failure = false; // Savestate load related
 };

@@ -172,12 +172,21 @@ s32 lv2_socket_native::bind(const sys_net_sockaddr& addr)
 		native_addr.sin_port = std::bit_cast<u16, be_t<u16>>(3659);
 	}
 
+	// Pier: the firmware's DHCP client binds 0.0.0.0:68, a privileged host port. Host it on an ephemeral port instead;
+	// its requests never reach the host network (see sendto), the emulated DHCP server answers over loopback.
+	dhcp_client = psa_in->sin_port == 68 && type == SYS_NET_SOCK_DGRAM;
+
+	if (dhcp_client)
+	{
+		native_addr.sin_port = 0;
+	}
+
 	sys_net.warning("[Native] Trying to bind %s:%d", native_addr.sin_addr, std::bit_cast<be_t<u16>, u16>(native_addr.sin_port));
 
 	if (::bind(native_socket, reinterpret_cast<struct sockaddr*>(&native_addr), native_addr_len) == 0)
 	{
 		// Only UPNP port forward binds to 0.0.0.0
-		if (saddr == 0)
+		if (saddr == 0 && !dhcp_client)
 		{
 			if (native_addr.sin_port == 0)
 			{
@@ -622,6 +631,14 @@ s32 lv2_socket_native::setsockopt(s32 level, s32 optname, const std::vector<u8>&
 {
 	std::lock_guard lock(mutex);
 
+	// Pier: the firmware's DHCP client sets IP_MULTICAST_TTL with a 1 byte value at start and, before every send,
+	// IP_MULTICAST_IF = 0.0.0.<ifindex> (BSD convention for "output interface by index"). The host would reject
+	// both (short value, address that does not exist) and the packets never leave the emulator anyway.
+	if (dhcp_client && level == SYS_NET_IPPROTO_IP && (optname == SYS_NET_IP_MULTICAST_IF || optname == SYS_NET_IP_MULTICAST_TTL))
+	{
+		return {};
+	}
+
 	int native_int         = 0;
 	int native_level       = -1;
 	int native_opt         = -1;
@@ -986,6 +1003,13 @@ std::optional<s32> lv2_socket_native::sendto(s32 flags, const std::vector<u8>& b
 	{
 		native_addr = sys_net_addr_to_native_addr(*opt_sn_addr);
 		sys_net.trace("[Native] Attempting to send to %s:%d", (*native_addr).sin_addr, std::bit_cast<be_t<u16>, u16>((*native_addr).sin_port));
+
+		// Pier: DHCP requests of the firmware are answered by the emulated server, never sent to the host network
+		if (dhcp_client && reinterpret_cast<const sys_net_sockaddr_in*>(&*opt_sn_addr)->sin_port == 67)
+		{
+			net_dhcp_serve(native_socket, buf);
+			return {::narrow<s32>(buf.size())};
+		}
 
 		auto& nph = g_fxo->get<named_thread<np::np_handler>>();
 		if (!nph.get_net_status() && is_ip_public_address(*native_addr))

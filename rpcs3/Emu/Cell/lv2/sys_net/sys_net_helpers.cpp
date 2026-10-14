@@ -6,10 +6,18 @@
 #include "sys_net_helpers.h"
 #include "network_context.h"
 
-#ifdef _WIN32
 #include "Emu/NP/np_handler.h"
 #include "Emu/NP/np_helpers.h"
+#include "Emu/Cell/Modules/cellNetCtl.h"
+
+#ifdef _WIN32
+#include <iphlpapi.h>
+#else
+#include <ifaddrs.h>
+#include <unistd.h>
 #endif
+
+#include <cstdio>
 
 LOG_CHANNEL(sys_net);
 
@@ -289,3 +297,277 @@ void windows_poll(std::vector<pollfd>& fds, unsigned long nfds, int timeout, std
 	}
 }
 #endif
+
+namespace
+{
+	// Netmask and default gateway of the host interface that owns `ip`. Network byte order, 0 = unknown.
+	void net_host_ipv4_params(u32 ip, u32& mask, u32& gateway)
+	{
+		mask = 0;
+		gateway = 0;
+
+#ifdef _WIN32
+		ULONG size = 0;
+		if (GetAdaptersInfo(nullptr, &size) != ERROR_BUFFER_OVERFLOW)
+		{
+			return;
+		}
+
+		std::vector<u8> buf(size);
+		auto* info = reinterpret_cast<PIP_ADAPTER_INFO>(buf.data());
+
+		if (GetAdaptersInfo(info, &size) != NO_ERROR)
+		{
+			return;
+		}
+
+		for (auto* adapter = info; adapter; adapter = adapter->Next)
+		{
+			for (auto* entry = &adapter->IpAddressList; entry; entry = entry->Next)
+			{
+				in_addr addr{}, netmask{}, gw{};
+
+				if (inet_pton(AF_INET, entry->IpAddress.String, &addr) == 1 && addr.s_addr == ip && inet_pton(AF_INET, entry->IpMask.String, &netmask) == 1)
+				{
+					mask = netmask.s_addr;
+
+					if (inet_pton(AF_INET, adapter->GatewayList.IpAddress.String, &gw) == 1)
+					{
+						gateway = gw.s_addr;
+					}
+
+					return;
+				}
+			}
+		}
+#else
+		[[maybe_unused]] std::string ifname;
+		ifaddrs* ifap = nullptr;
+
+		if (getifaddrs(&ifap) != 0)
+		{
+			return;
+		}
+
+		for (const ifaddrs* p = ifap; p; p = p->ifa_next)
+		{
+			if (p->ifa_addr && p->ifa_netmask && p->ifa_addr->sa_family == AF_INET && reinterpret_cast<const ::sockaddr_in*>(p->ifa_addr)->sin_addr.s_addr == ip)
+			{
+				mask = reinterpret_cast<const ::sockaddr_in*>(p->ifa_netmask)->sin_addr.s_addr;
+				ifname = p->ifa_name;
+				break;
+			}
+		}
+
+		freeifaddrs(ifap);
+
+#ifdef __linux__
+		// Default route of that interface: Destination 0, Mask 0, RTF_GATEWAY (0x2). Fields are printed as raw
+		// network-order words, so sscanf gives the same value as in_addr::s_addr.
+		if (!ifname.empty())
+		{
+			if (FILE* f = std::fopen("/proc/net/route", "r"))
+			{
+				char line[256];
+
+				while (std::fgets(line, sizeof(line), f))
+				{
+					char iface[64]{};
+					unsigned dest = 0, gw = 0, flags = 0, refcnt = 0, use = 0, metric = 0, msk = 0;
+
+					if (std::sscanf(line, "%63s %x %x %x %u %u %u %x", iface, &dest, &gw, &flags, &refcnt, &use, &metric, &msk) == 8 && ifname == iface && dest == 0 && msk == 0 && (flags & 0x2) && gw)
+					{
+						gateway = gw;
+						break;
+					}
+				}
+
+				std::fclose(f);
+			}
+		}
+#endif
+#endif
+	}
+}
+
+bool net_get_lease(net_lease_t& lease)
+{
+	auto& nph = g_fxo->get<named_thread<np::np_handler>>();
+
+	// No host route (np_handler stays Disconnected): the console is offline, nothing to offer
+	if (nph.get_net_status() != CELL_NET_CTL_STATE_IPObtained || !nph.get_local_ip_addr())
+	{
+		return false;
+	}
+
+	lease.ip = nph.get_local_ip_addr();
+	lease.dns = nph.get_dns_ip();
+	lease.mac = nph.get_ether_addr();
+
+	u32 mask = 0, gateway = 0;
+	net_host_ipv4_params(lease.ip, mask, gateway);
+
+	// Host netmask unreadable (sandbox, exotic OS): assume /24
+	if (!mask)
+	{
+		mask = std::bit_cast<u32>(std::array<u8, 4>{255, 255, 255, 0});
+	}
+
+	// Host default route unreadable, or not on this subnet: x.y.z.1 of the subnet (x.y.z.254 if that is the console itself)
+	if (!gateway || ((gateway ^ lease.ip) & mask))
+	{
+		gateway = (lease.ip & mask) | std::bit_cast<u32>(std::array<u8, 4>{0, 0, 0, 1});
+
+		if (gateway == lease.ip)
+		{
+			gateway = (lease.ip & mask) | std::bit_cast<u32>(std::array<u8, 4>{0, 0, 0, 254});
+		}
+	}
+
+	lease.mask = mask;
+	lease.gateway = gateway;
+	return true;
+}
+
+void net_dhcp_serve(socket_type guest_socket, const std::vector<u8>& req)
+{
+	// BOOTP header (236 bytes) + magic cookie + at least one option
+	if (req.size() < 241 || req[0] != 1 || req[236] != 0x63 || req[237] != 0x82 || req[238] != 0x53 || req[239] != 0x63)
+	{
+		return;
+	}
+
+	u8 msg_type = 0;
+
+	for (usz i = 240; i + 1 < req.size() && req[i] != 255;)
+	{
+		if (req[i] == 0)
+		{
+			i++;
+			continue;
+		}
+
+		const usz len = req[i + 1];
+
+		if (i + 2 + len > req.size())
+		{
+			break;
+		}
+
+		if (req[i] == 53 && len >= 1)
+		{
+			msg_type = req[i + 2];
+		}
+
+		i += 2 + len;
+	}
+
+	// DISCOVER -> OFFER, REQUEST -> ACK. Everything else (DECLINE, RELEASE, INFORM) is dropped.
+	if (msg_type != 1 && msg_type != 3)
+	{
+		sys_net.notice("net_dhcp_serve: DHCP message type %d ignored", msg_type);
+		return;
+	}
+
+	net_lease_t lease;
+
+	if (!net_get_lease(lease))
+	{
+		sys_net.notice("net_dhcp_serve: host has no route, no lease offered");
+		return;
+	}
+
+	sys_net.notice("net_dhcp_serve: DHCP%s xid=0x%08x -> %s: ip=%s mask=%s gateway=%s dns=%s", msg_type == 1 ? "DISCOVER" : "REQUEST", (u32{req[4]} << 24 | u32{req[5]} << 16 | u32{req[6]} << 8 | u32{req[7]}), msg_type == 1 ? "OFFER" : "ACK", np::ip_to_string(lease.ip), np::ip_to_string(lease.mask), np::ip_to_string(lease.gateway), np::ip_to_string(lease.dns));
+
+	constexpr u32 lease_secs = 86400;
+	std::vector<u8> r(300, 0);
+
+	r[0] = 2;                                    // BOOTREPLY
+	r[1] = req[1];                               // htype
+	r[2] = req[2];                               // hlen
+	std::memcpy(&r[4], &req[4], 4);              // xid, the firmware matches it
+	std::memcpy(&r[10], &req[10], 2);            // flags
+	if (msg_type == 3)
+	{
+		std::memcpy(&r[12], &req[12], 4);        // ciaddr (renewals)
+	}
+	std::memcpy(&r[16], &lease.ip, 4);           // yiaddr
+	std::memcpy(&r[20], &lease.gateway, 4);      // siaddr
+	std::memcpy(&r[28], &req[28], 16);           // chaddr, the firmware compares the first 6 bytes with its own MAC
+	r[236] = 0x63; r[237] = 0x82; r[238] = 0x53; r[239] = 0x63;
+
+	usz pos = 240;
+
+	const auto put = [&](u8 code, const void* data, u8 len)
+	{
+		r[pos++] = code;
+		r[pos++] = len;
+		std::memcpy(&r[pos], data, len);
+		pos += len;
+	};
+
+	const auto put_u32 = [&](u8 code, u32 v)
+	{
+		const be_t<u32> be = v;
+		put(code, &be, 4);
+	};
+
+	const u8 reply_type = msg_type == 1 ? 2 : 5;
+	put(53, &reply_type, 1);
+	put(54, &lease.gateway, 4);       // server id: required, non-zero, by the firmware's ACK handling
+	put_u32(51, lease_secs);          // lease time: required, non-zero
+	put_u32(58, lease_secs / 2);      // T1
+	put_u32(59, lease_secs / 8 * 7);  // T2
+	put(1, &lease.mask, 4);
+	put(3, &lease.gateway, 4);
+
+	if (lease.dns)
+	{
+		put(6, &lease.dns, 4);
+	}
+
+	const u32 broadcast = lease.ip | ~lease.mask;
+	put(28, &broadcast, 4);
+	r[pos++] = 255;
+
+	// The guest socket sits on an ephemeral host port (see lv2_socket_native::bind). Hand the reply to it from a
+	// throw-away host socket: the guest's recvfrom/select/poll then work unchanged.
+	::sockaddr_in dst{};
+	::socklen_t dst_len = sizeof(dst);
+
+	if (::getsockname(guest_socket, reinterpret_cast<::sockaddr*>(&dst), &dst_len) != 0 || dst.sin_family != AF_INET)
+	{
+		return;
+	}
+
+	if (dst.sin_addr.s_addr == 0)
+	{
+		dst.sin_addr.s_addr = std::bit_cast<u32>(std::array<u8, 4>{127, 0, 0, 1});
+	}
+
+	const auto s = ::socket(AF_INET, SOCK_DGRAM, 0);
+
+#ifdef _WIN32
+	if (s == INVALID_SOCKET)
+#else
+	if (s < 0)
+#endif
+	{
+		return;
+	}
+
+	if (::sendto(s, reinterpret_cast<const char*>(r.data()), static_cast<int>(r.size()), 0, reinterpret_cast<const ::sockaddr*>(&dst), sizeof(dst)) < 0)
+	{
+		sys_net.error("net_dhcp_serve: delivering the reply failed (%d)", get_native_error());
+	}
+	else
+	{
+		sys_net.notice("net_dhcp_serve: reply delivered to %s:%d", np::ip_to_string(dst.sin_addr.s_addr), std::bit_cast<be_t<u16>, u16>(dst.sin_port));
+	}
+
+#ifdef _WIN32
+	::closesocket(s);
+#else
+	::close(s);
+#endif
+}
