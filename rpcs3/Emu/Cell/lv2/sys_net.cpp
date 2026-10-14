@@ -32,6 +32,7 @@
 #include "Emu/NP/np_handler.h"
 #include "Emu/NP/np_helpers.h"
 #include "Emu/Cell/timers.hpp"
+#include "Emu/system_config.h"
 #include <shared_mutex>
 
 #include "sys_net/network_context.h"
@@ -2002,27 +2003,158 @@ error_code sys_net_infoctl(ppu_thread& ppu, s32 cmd, vm::ptr<void> arg)
 	return CELL_OK;
 }
 
+// ---------------------------------------------------------------------------
+// Pier: emulated wired port (eth0) for the VSH network manager (ntm).
+// See scratch/pier/analysis/netlink.md for the disassembly this is based on.
+// ---------------------------------------------------------------------------
+namespace
+{
+	// sys_net_control(ifname*, op, buf*, 4): ifname is a guest C string ("eth0" = wired, "eth1" = WLAN)
+	constexpr u32 net_ctl_op_get_ether_link = 0x80020001; // out: be32 one-hot link mode, 0 = no link
+	constexpr u32 net_ctl_op_set_ether_mode = 0x81020000; // in:  be32 requested mode (0 = auto)
+
+	// One-hot values VSH accepts from net_ctl_op_get_ether_link (10/100/1000 x half/full)
+	constexpr u32 net_link_10_half   = 0x01;
+	constexpr u32 net_link_10_full   = 0x02;
+	constexpr u32 net_link_100_half  = 0x04;
+	constexpr u32 net_link_100_full  = 0x08;
+	constexpr u32 net_link_1000_half = 0x10;
+	constexpr u32 net_link_1000_full = 0x20;
+
+	// BSD ioctls on struct ifreq { char name[16]; union { sockaddr; be16 flags; ... } } (0x20 bytes)
+	constexpr u32 net_siocsifflags = 0x80206910;
+	constexpr u32 net_siocgifflags = 0xc0206911;
+	constexpr u32 net_siocgiflladdr = 0xc020698c; // Sony: MAC address returned in ifr_addr.sa_data (ifr + 18)
+
+	constexpr u16 net_iff_up        = 0x0001;
+	constexpr u16 net_iff_broadcast = 0x0002;
+	constexpr u16 net_iff_running   = 0x0040;
+	constexpr u16 net_iff_simplex   = 0x0800;
+	constexpr u16 net_iff_multicast = 0x8000;
+
+	atomic_t<u16> g_net_eth0_flags{static_cast<u16>(net_iff_broadcast | net_iff_simplex | net_iff_multicast)}; // administratively down
+	atomic_t<u32> g_net_eth0_mode{0};
+
+	bool net_link_is_up()
+	{
+		return g_cfg.net.net_active == np_internet_status::enabled;
+	}
+
+	bool net_ifname_is_wired(u32 addr)
+	{
+		std::string name;
+		return addr && vm::read_string(addr, 16, name, true) && name == "eth0";
+	}
+
+	u8* net_guest_buf(u32 addr, u32 size, u8 flags)
+	{
+		return addr && vm::check_addr(addr, flags, size) ? vm::get_super_ptr<u8>(addr) : nullptr;
+	}
+}
+
 error_code sys_net_control(ppu_thread& ppu, u32 arg1, s32 arg2, vm::ptr<void> arg3, s32 arg4)
 {
 	ppu.state += cpu_flag::wait;
 
-	sys_net.todo("sys_net_control(0x%x, %d, *0x%x, %d)", arg1, arg2, arg3, arg4);
+	switch (static_cast<u32>(arg2))
+	{
+	case net_ctl_op_get_ether_link:
+	{
+		sys_net.trace("sys_net_control(GET_ETHER_LINK, ifname=*0x%x, buf=*0x%x, len=%d)", arg1, arg3, arg4);
+
+		if (!arg3 || arg4 != 4)
+		{
+			return -SYS_NET_EINVAL;
+		}
+
+		const u32 mode = (net_ifname_is_wired(arg1) && net_link_is_up()) ? net_link_1000_full : 0;
+		vm::static_ptr_cast<u32>(arg3)[0] = mode;
+		return CELL_OK;
+	}
+	case net_ctl_op_set_ether_mode:
+	{
+		sys_net.trace("sys_net_control(SET_ETHER_MODE, ifname=*0x%x, buf=*0x%x, len=%d)", arg1, arg3, arg4);
+
+		if (!arg3 || arg4 != 4)
+		{
+			return -SYS_NET_EINVAL;
+		}
+
+		g_net_eth0_mode = static_cast<u32>(vm::static_ptr_cast<u32>(arg3)[0]);
+		return CELL_OK;
+	}
+	default: break;
+	}
+
+	// Other ops (0x8008xxxx multicast filter, 0x8101xxxx, 0x8104xxxx, ...) only need to succeed
+	sys_net.todo("sys_net_control(0x%x, 0x%x, *0x%x, %d)", arg1, static_cast<u32>(arg2), arg3, arg4);
 	return CELL_OK;
 }
 
-error_code sys_net_bnet_ioctl(ppu_thread& ppu, s32 arg1, u32 arg2, u32 arg3)
+error_code sys_net_bnet_ioctl(ppu_thread& ppu, s32 arg1, u32 arg2, vm::ptr<void> arg3)
 {
 	ppu.state += cpu_flag::wait;
 
-	sys_net.todo("sys_net_bnet_ioctl(%d, 0x%x, 0x%x)", arg1, arg2, arg3);
+	switch (arg2)
+	{
+	case net_siocgifflags:
+	case net_siocsifflags:
+	case net_siocgiflladdr:
+	{
+		u8* const ifr = net_guest_buf(arg3.addr(), 0x20, vm::page_writable);
+
+		if (!ifr)
+		{
+			return -SYS_NET_EFAULT;
+		}
+
+		if (!net_ifname_is_wired(arg3.addr()))
+		{
+			break; // eth1/lo0/...: keep returning success without touching the buffer
+		}
+
+		if (arg2 == net_siocgifflags)
+		{
+			const u16 f = g_net_eth0_flags;
+			const u16 out = (f & net_iff_up) ? static_cast<u16>(f | net_iff_running) : static_cast<u16>(f & ~net_iff_running);
+			ifr[16] = static_cast<u8>(out >> 8);
+			ifr[17] = static_cast<u8>(out);
+		}
+		else if (arg2 == net_siocsifflags)
+		{
+			g_net_eth0_flags = static_cast<u16>(((ifr[16] << 8) | ifr[17]) & ~net_iff_running);
+		}
+		else
+		{
+			const auto& mac = g_fxo->get<named_thread<np::np_handler>>().get_ether_addr();
+			ifr[16] = 20; // sa_len (not read by VSH)
+			ifr[17] = 18; // AF_LINK (not read by VSH)
+			std::memcpy(ifr + 18, mac.data(), 6);
+		}
+
+		return CELL_OK;
+	}
+	default: break;
+	}
+
+	sys_net.todo("sys_net_bnet_ioctl(%d, 0x%x, *0x%x)", arg1, arg2, arg3);
 	return CELL_OK;
 }
 
-error_code sys_net_bnet_sysctl(ppu_thread& ppu, u32 arg1, u32 arg2, u32 arg3, vm::ptr<void> arg4, u32 arg5, u32 arg6)
+error_code sys_net_bnet_sysctl(ppu_thread& ppu, vm::cptr<s32> name, u32 namelen, vm::ptr<void> oldp, vm::ptr<u64> oldlenp, vm::cptr<void> newp, u32 newlen)
 {
 	ppu.state += cpu_flag::wait;
 
-	sys_net.todo("sys_net_bnet_sysctl(0x%x, 0x%x, 0x%x, *0x%x, 0x%x, 0x%x)", arg1, arg2, arg3, arg4, arg5, arg6);
+	if (!oldlenp)
+	{
+		sys_net.todo("sys_net_bnet_sysctl(name=*0x%x, namelen=%d, oldp=*0x%x, oldlenp=*0x%x, newp=*0x%x, newlen=0x%x)", name, namelen, oldp, oldlenp, newp, newlen);
+		return CELL_OK;
+	}
+
+	// ponytail: every table is empty. VSH reads *oldlenp back and mallocs that many bytes, so it must be
+	// written. NET_RT_IFLIST (interface list) is modelled in analysis/netlink.md if a later screen needs it.
+	sys_net.todo("sys_net_bnet_sysctl(name=*0x%x, namelen=%d, oldp=*0x%x, oldlenp=*0x%x, newp=*0x%x, newlen=0x%x)", name, namelen, oldp, oldlenp, newp, newlen);
+	*oldlenp = 0;
 	return CELL_OK;
 }
 

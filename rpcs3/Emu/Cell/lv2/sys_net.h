@@ -394,6 +394,6 @@ error_code _sys_net_write_dump(ppu_thread&, s32 id, vm::cptr<void> buf, s32 len,
 error_code sys_net_abort(ppu_thread&, s32 type, u64 arg, s32 flags);
 error_code sys_net_infoctl(ppu_thread&, s32 cmd, vm::ptr<void> arg);
 error_code sys_net_control(ppu_thread&, u32 arg1, s32 arg2, vm::ptr<void> arg3, s32 arg4);
-error_code sys_net_bnet_ioctl(ppu_thread&, s32 arg1, u32 arg2, u32 arg3);
-error_code sys_net_bnet_sysctl(ppu_thread&, u32 arg1, u32 arg2, u32 arg3, vm::ptr<void> arg4, u32 arg5, u32 arg6);
+error_code sys_net_bnet_ioctl(ppu_thread&, s32 arg1, u32 arg2, vm::ptr<void> arg3);
+error_code sys_net_bnet_sysctl(ppu_thread&, vm::cptr<s32> name, u32 namelen, vm::ptr<void> oldp, vm::ptr<u64> oldlenp, vm::cptr<void> newp, u32 newlen);
 error_code sys_net_eurus_post_command(ppu_thread&, s32 arg1, u32 arg2, u32 arg3);
