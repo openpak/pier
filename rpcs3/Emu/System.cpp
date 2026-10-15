@@ -2685,8 +2685,9 @@ game_boot_result Emulator::Load(const std::string& title_id, bool is_disc_patch,
 					m_dir = "/dev_hdd0/game/" + dirname + "/";
 					sys_log.notice("Boot path: %s", m_dir);
 				}
-				else if (!bdvd_dir.empty() && fs::is_dir(bdvd_dir))
+				else if (!from_dev_flash && !bdvd_dir.empty() && fs::is_dir(bdvd_dir))
 				{
+					// An inserted disc must not rewrite firmware executable paths.
 					// Disc games are on /dev_bdvd/
 					const std::string& disc_path = launching_from_disc_archive ? m_path : resolved_path;
 					const usz pos = disc_path.rfind(m_game_dir);
