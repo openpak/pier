@@ -1,4 +1,5 @@
 #include "stdafx.h"
+#include "Emu/Cell/lv2/native_console_runtime.h"
 #include "Emu/NP/ip_address.h"
 #include "nt_p2p_port.h"
 #include "lv2_socket_p2ps.h"
@@ -90,6 +91,38 @@ nt_p2p_port::nt_p2p_port(u16 port)
 			ret_bind = ::bind(p2p_socket, reinterpret_cast<const sockaddr*>(&p2p_ipv4_addr), sizeof(p2p_ipv4_addr));
 		}
 	}
+
+#ifdef __linux__
+	// A game child of the native console shares the host with VSH, whose own
+	// P2P socket already holds this port. The guest still sees `port`; only the
+	// host socket moves to an ephemeral port (NAT translates it anyway, and peers
+	// use the address OpenPak's servers observe).
+	if (ret_bind == -1 && errno == EADDRINUSE)
+	{
+		const auto& context = g_fxo->get<pier::native_console_context>();
+		if (context.kernel && context.parent_pid)
+		{
+			::sockaddr_storage any{};
+			::socklen_t len = sizeof(::sockaddr_in);
+			if (is_ipv6)
+			{
+				reinterpret_cast<::sockaddr_in6&>(any).sin6_family = AF_INET6;
+				len = sizeof(::sockaddr_in6);
+			}
+			else
+			{
+				reinterpret_cast<::sockaddr_in&>(any).sin_family = AF_INET;
+			}
+			if (ret_bind = ::bind(p2p_socket, reinterpret_cast<const sockaddr*>(&any), len); ret_bind == 0)
+			{
+				::getsockname(p2p_socket, reinterpret_cast<sockaddr*>(&any), &len);
+				const u16 host_port = is_ipv6 ? reinterpret_cast<::sockaddr_in6&>(any).sin6_port : reinterpret_cast<::sockaddr_in&>(any).sin_port;
+				sys_net.warning("P2P port %d is VSH's on this host; this game child uses host port %d", port, std::bit_cast<be_t<u16>>(host_port).value());
+				return;
+			}
+		}
+	}
+#endif
 
 	if (ret_bind == -1)
 		fmt::throw_exception("Failed to bind DGRAM socket to %d for P2P: %s!", port, get_last_error(true));
