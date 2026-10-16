@@ -9,10 +9,20 @@
 #include "Emu/Cell/timers.hpp"
 
 #include "sys_cond.h"
+#include "native_console_runtime.h"
 
 #include "util/asm.hpp"
 
 LOG_CHANNEL(sys_cond);
+
+#ifdef __linux__
+static std::shared_ptr<pier::native_condition> get_native_condition(u32 id)
+{
+	if (!g_fxo->get<pier::native_console_context>().kernel) return {};
+	const auto object = idm::get<lv2_obj, lv2_cond>(id, [](lv2_cond& condition) { return condition.native; });
+	return object ? object.ret : nullptr;
+}
+#endif
 
 lv2_cond::lv2_cond(utils::serial& ar) noexcept
 	: key(ar)
@@ -72,11 +82,16 @@ CellError lv2_cond::on_id_create()
 
 std::function<void(void*)> lv2_cond::load(utils::serial& ar)
 {
+#ifdef __linux__
+	if (g_fxo->get<pier::native_console_context>().kernel)
+		fmt::throw_exception("Native console condition savestate restoration is not supported");
+#endif
 	return load_func(make_shared<lv2_cond>(stx::exact_t<utils::serial&>(ar)));
 }
 
 void lv2_cond::save(utils::serial& ar)
 {
+	if (native) fmt::throw_exception("Native console condition savestates are not supported");
 	ar(key, name, mtx_id);
 }
 
@@ -85,8 +100,10 @@ error_code sys_cond_create(ppu_thread& ppu, vm::ptr<u32> cond_id, u32 mutex_id, 
 	ppu.state += cpu_flag::wait;
 
 	sys_cond.trace("sys_cond_create(cond_id=*0x%x, mutex_id=0x%x, attr=*0x%x)", cond_id, mutex_id, attr);
+	if (!cond_id || !attr) return CELL_EFAULT;
 
-	auto mutex = idm::get_unlocked<lv2_obj, lv2_mutex>(mutex_id);
+	std::shared_ptr<pier::native_mutex> native_mutex;
+	auto mutex = idm::get<lv2_obj, lv2_mutex>(mutex_id, [&](lv2_mutex& value) { native_mutex = value.native; });
 
 	if (!mutex)
 	{
@@ -102,13 +119,29 @@ error_code sys_cond_create(ppu_thread& ppu, vm::ptr<u32> cond_id, u32 mutex_id, 
 		sys_cond.warning("sys_cond_create(cond_id=*0x%x, attr=*0x%x): IPC=0x%016x", cond_id, attr, ipc_key);
 	}
 
-	if (const auto error = lv2_obj::create<lv2_cond>(_attr.pshared, ipc_key, _attr.flags, [&]
+	std::shared_ptr<pier::native_condition> native;
+	s32 local_flags = _attr.flags;
+#ifdef __linux__
+	if (native_mutex)
 	{
-		return make_single<lv2_cond>(
+		if (!ipc_key) return CELL_ENOSYS;
+		auto& kernel = g_fxo->get<pier::native_console_context>().kernel;
+		auto result = kernel->open_condition(ipc_key, static_cast<pier::native_console_sync::open_mode>(+_attr.flags), native_mutex->handle);
+		if (result.code != pier::native_console_sync::status::ok) return pier::native_console_error(result.code);
+		native = std::make_shared<pier::native_condition>(native_mutex, std::move(*result.handle));
+		local_flags = SYS_SYNC_NOT_CARE;
+		sys_cond.notice("Native console condition attached: IPC=0x%016x", ipc_key);
+	}
+#endif
+	if (const auto error = lv2_obj::create<lv2_cond>(_attr.pshared, ipc_key, local_flags, [&]
+	{
+		auto result = make_single<lv2_cond>(
 			ipc_key,
 			_attr.name_u64,
 			mutex_id,
 			std::move(mutex));
+		result->native = native;
+		return result;
 	}))
 	{
 		return error;
@@ -128,6 +161,15 @@ error_code sys_cond_destroy(ppu_thread& ppu, u32 cond_id)
 	const auto cond = idm::withdraw<lv2_obj, lv2_cond>(cond_id, [&](lv2_cond& cond) -> CellError
 	{
 		std::lock_guard lock(cond.mutex->mutex);
+
+#ifdef __linux__
+		if (cond.native)
+		{
+			const auto state = cond.native->handle.idle();
+			if (state != pier::native_console_sync::status::ok) return pier::native_console_error(state);
+			if (cond.native.use_count() > 1) return CELL_EBUSY;
+		}
+#endif
 
 		if (atomic_storage<ppu_thread*>::load(cond.sq))
 		{
@@ -162,6 +204,10 @@ error_code sys_cond_signal(ppu_thread& ppu, u32 cond_id)
 	ppu.state += cpu_flag::wait;
 
 	sys_cond.trace("sys_cond_signal(cond_id=0x%x)", cond_id);
+
+#ifdef __linux__
+	if (auto native = get_native_condition(cond_id)) return pier::native_console_error(native->handle.signal());
+#endif
 
 	while (true)
 	{
@@ -234,6 +280,10 @@ error_code sys_cond_signal_all(ppu_thread& ppu, u32 cond_id)
 	ppu.state += cpu_flag::wait;
 
 	sys_cond.trace("sys_cond_signal_all(cond_id=0x%x)", cond_id);
+
+#ifdef __linux__
+	if (auto native = get_native_condition(cond_id)) return pier::native_console_error(native->handle.signal(true));
+#endif
 
 	while (true)
 	{
@@ -316,6 +366,19 @@ error_code sys_cond_signal_to(ppu_thread& ppu, u32 cond_id, u32 thread_id)
 	ppu.state += cpu_flag::wait;
 
 	sys_cond.trace("sys_cond_signal_to(cond_id=0x%x, thread_id=0x%x)", cond_id, thread_id);
+
+#ifdef __linux__
+	if (auto native = get_native_condition(cond_id))
+	{
+		const auto target = g_fxo->get<pier::native_console_context>().kernel->resolve_ppu_thread(thread_id);
+		if (target.code != pier::native_console_sync::status::ok) return pier::native_console_error(target.code);
+		const auto result = native->handle.signal(false, target.actor);
+		// A real target thread that is not waiting on this condition is EPERM;
+		// a missing public thread ID was already rejected above as ESRCH.
+		if (result == pier::native_console_sync::status::not_found) return CELL_EPERM;
+		return pier::native_console_error(result);
+	}
+#endif
 
 	const u64 start_time = get_system_time();
 	bool has_lower_prio_or_is_the_mutex_owner = false;
@@ -432,6 +495,26 @@ error_code sys_cond_wait(ppu_thread& ppu, u32 cond_id, u64 timeout)
 	ppu.state += cpu_flag::wait;
 
 	sys_cond.trace("sys_cond_wait(cond_id=0x%x, timeout=%lld)", cond_id, timeout);
+
+#ifdef __linux__
+	if (auto native = get_native_condition(cond_id))
+	{
+		lv2_obj::sleep(ppu);
+		const auto result = native->handle.wait(ppu.id, ppu.prio.load().prio, timeout, [&]
+		{
+			return is_stopped(+ppu.state);
+		});
+		if (result == pier::native_console_sync::status::cancelled)
+		{
+			ppu.state += cpu_flag::again;
+			return {};
+		}
+		lv2_obj::awake(&ppu);
+		ppu.state -= cpu_flag::signal;
+		ppu.check_state();
+		return pier::native_console_error(result);
+	}
+#endif
 
 	// Further function result
 	ppu.gpr[3] = CELL_OK;

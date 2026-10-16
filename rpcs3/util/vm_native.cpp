@@ -530,6 +530,28 @@ namespace utils
 #endif
 	}
 
+#ifdef __linux__
+	shm::shm(u64 size, int borrowed_fd, u64 offset)
+		: m_file(-1)
+		, m_offset(offset)
+		, m_flags(1)
+		, m_size(size)
+	{
+		struct stat info{};
+		if (!size || size % 0x10000 || offset % 0x10000 ||
+			::fstat(borrowed_fd, &info) < 0 || !S_ISREG(info.st_mode) ||
+			info.st_size < 0 || offset > static_cast<u64>(info.st_size) ||
+			size > static_cast<u64>(info.st_size) - offset)
+		{
+			fmt::throw_exception("Invalid imported shared-memory region (size=0x%x, offset=0x%x)", size, offset);
+		}
+
+		m_file = ::fcntl(borrowed_fd, F_DUPFD_CLOEXEC, 0);
+		if (m_file < 0)
+			fmt::throw_exception("Could not duplicate imported shared-memory descriptor (errno=%d)", errno);
+	}
+#endif
+
 	shm::shm(u64 size, const std::string& storage)
 		: m_size(utils::align(size, 0x10000))
 	{
@@ -857,7 +879,7 @@ namespace utils
 
 		if (ptr64)
 		{
-			const auto result = ::mmap(reinterpret_cast<void*>(ptr64), m_size, +prot, (cow ? MAP_PRIVATE : MAP_SHARED) | MAP_FIXED, m_file, 0);
+			const auto result = ::mmap(reinterpret_cast<void*>(ptr64), m_size, +prot, (cow ? MAP_PRIVATE : MAP_SHARED) | MAP_FIXED, m_file, m_offset);
 
 			return reinterpret_cast<u8*>(result);
 		}
@@ -866,7 +888,7 @@ namespace utils
 			const u64 res64 = reinterpret_cast<u64>(::mmap(reinterpret_cast<void*>(ptr64), m_size + 0xf000, PROT_NONE, MAP_ANON | MAP_PRIVATE, -1, 0));
 
 			const u64 aligned = utils::align(res64, 0x10000);
-			const auto result = ::mmap(reinterpret_cast<void*>(aligned), m_size, +prot, (cow ? MAP_PRIVATE : MAP_SHARED) | MAP_FIXED, m_file, 0);
+			const auto result = ::mmap(reinterpret_cast<void*>(aligned), m_size, +prot, (cow ? MAP_PRIVATE : MAP_SHARED) | MAP_FIXED, m_file, m_offset);
 
 			// Now cleanup remnants
 			if (aligned > res64)
@@ -892,7 +914,7 @@ namespace utils
 #ifdef _WIN32
 		return this->map(target, prot, cow);
 #else
-		const auto result = reinterpret_cast<u8*>(::mmap(reinterpret_cast<void*>(target), m_size, +prot, (cow ? MAP_PRIVATE : MAP_SHARED), m_file, 0));
+		const auto result = reinterpret_cast<u8*>(::mmap(reinterpret_cast<void*>(target), m_size, +prot, (cow ? MAP_PRIVATE : MAP_SHARED), m_file, m_offset));
 
 		if (result == reinterpret_cast<void*>(uptr{umax}))
 		{

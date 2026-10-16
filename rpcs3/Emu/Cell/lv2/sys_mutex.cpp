@@ -9,8 +9,20 @@
 #include "util/asm.hpp"
 
 #include "sys_mutex.h"
+#include "native_console_runtime.h"
+
+void pier_native_diag_game();
 
 LOG_CHANNEL(sys_mutex);
+
+#ifdef __linux__
+static std::shared_ptr<pier::native_mutex> get_native_mutex(u32 id)
+{
+	if (!g_fxo->get<pier::native_console_context>().kernel) return {};
+	const auto object = idm::get<lv2_obj, lv2_mutex>(id, [](lv2_mutex& mutex) { return mutex.native; });
+	return object ? object.ret : nullptr;
+}
+#endif
 
 lv2_mutex::lv2_mutex(utils::serial& ar)
 	: protocol(ar)
@@ -27,11 +39,16 @@ lv2_mutex::lv2_mutex(utils::serial& ar)
 
 std::function<void(void*)> lv2_mutex::load(utils::serial& ar)
 {
+#ifdef __linux__
+	if (g_fxo->get<pier::native_console_context>().kernel)
+		fmt::throw_exception("Native console mutex savestate restoration is not supported");
+#endif
 	return load_func(make_shared<lv2_mutex>(stx::exact_t<utils::serial&>(ar)));
 }
 
 void lv2_mutex::save(utils::serial& ar)
 {
+	if (native) fmt::throw_exception("Native console mutex savestates are not supported");
 	ar(protocol, recursive, adaptive, key, name, lock_count, control.raw().owner << 1);
 }
 
@@ -52,7 +69,7 @@ error_code sys_mutex_create(ppu_thread& ppu, vm::ptr<u32> mutex_id, vm::ptr<sys_
 
 	if (ipc_key)
 	{
-		sys_mutex.warning("sys_mutex_create(mutex_id=*0x%x, attr=*0x%x): IPC=0x%016x", mutex_id, attr, ipc_key);
+		sys_mutex.warning("sys_mutex_create(mutex_id=*0x%x, attr=*0x%x): IPC=0x%016x, flags=0x%x, name=0x%016x", mutex_id, attr, ipc_key, _attr.flags, _attr.name_u64);
 	}
 
 	switch (_attr.protocol)
@@ -85,14 +102,36 @@ error_code sys_mutex_create(ppu_thread& ppu, vm::ptr<u32> mutex_id, vm::ptr<sys_
 		sys_mutex.todo("sys_mutex_create(): unexpected adaptive (0x%x)", _attr.adaptive);
 	}
 
-	if (auto error = lv2_obj::create<lv2_mutex>(_attr.pshared, ipc_key, _attr.flags, [&]()
+	std::shared_ptr<pier::native_mutex> native;
+	s32 local_flags = _attr.flags;
+#ifdef __linux__
+	if (ipc_key)
 	{
-		return make_shared<lv2_mutex>(
+		if (auto& kernel = g_fxo->get<pier::native_console_context>().kernel; kernel)
+		{
+			auto result = kernel->open_mutex(ipc_key, static_cast<pier::native_console_sync::open_mode>(+_attr.flags),
+				static_cast<pier::native_console_sync::protocol>(+_attr.protocol), _attr.recursive == SYS_SYNC_RECURSIVE);
+			if (result.code != pier::native_console_sync::status::ok) return pier::native_console_error(result.code);
+			native = std::make_shared<pier::native_mutex>(std::move(*result.handle));
+			// The console registry already enforced native create/open flags.
+			// This local object is a handle to that existing shared kernel object.
+			local_flags = SYS_SYNC_NOT_CARE;
+			sys_mutex.notice("Native console mutex attached: IPC=0x%016x", ipc_key);
+			if (ipc_key == 0x8006010000000020 && _attr.flags == SYS_SYNC_NEWLY_CREATED)
+				pier_native_diag_game();
+		}
+	}
+#endif
+	if (auto error = lv2_obj::create<lv2_mutex>(_attr.pshared, ipc_key, local_flags, [&]()
+	{
+		auto result = make_shared<lv2_mutex>(
 			_attr.protocol,
 			_attr.recursive,
 			_attr.adaptive,
 			ipc_key,
 			_attr.name_u64);
+		result->native = native;
+		return result;
 	}))
 	{
 		return error;
@@ -112,6 +151,15 @@ error_code sys_mutex_destroy(ppu_thread& ppu, u32 mutex_id)
 	const auto mutex = idm::withdraw<lv2_obj, lv2_mutex>(mutex_id, [](lv2_mutex& mutex) -> CellError
 	{
 		std::lock_guard lock(mutex.mutex);
+
+#ifdef __linux__
+		if (mutex.native)
+		{
+			const auto state = mutex.native->handle.idle();
+			if (state != pier::native_console_sync::status::ok) return pier::native_console_error(state);
+			if (mutex.native.use_count() > 1) return CELL_EBUSY;
+		}
+#endif
 
 		if (atomic_storage<u32>::load(mutex.control.raw().owner))
 		{
@@ -150,6 +198,26 @@ error_code sys_mutex_lock(ppu_thread& ppu, u32 mutex_id, u64 timeout)
 	ppu.state += cpu_flag::wait;
 
 	sys_mutex.trace("sys_mutex_lock(mutex_id=0x%x, timeout=0x%llx)", mutex_id, timeout);
+
+#ifdef __linux__
+	if (auto native = get_native_mutex(mutex_id))
+	{
+		lv2_obj::sleep(ppu);
+		const auto result = native->handle.lock(ppu.id, ppu.prio.load().prio, timeout, [&]
+		{
+			return is_stopped(+ppu.state);
+		});
+		if (result == pier::native_console_sync::status::cancelled)
+		{
+			ppu.state += cpu_flag::again;
+			return {};
+		}
+		lv2_obj::awake(&ppu);
+		ppu.state -= cpu_flag::signal;
+		ppu.check_state();
+		return pier::native_console_error(result);
+	}
+#endif
 
 	const auto mutex = idm::get<lv2_obj, lv2_mutex>(mutex_id, [&, notify = lv2_obj::notify_all_t()](lv2_mutex& mutex)
 	{
@@ -315,6 +383,10 @@ error_code sys_mutex_trylock(ppu_thread& ppu, u32 mutex_id)
 
 	sys_mutex.trace("sys_mutex_trylock(mutex_id=0x%x)", mutex_id);
 
+#ifdef __linux__
+	if (auto native = get_native_mutex(mutex_id)) return pier::native_console_error(native->handle.try_lock(ppu.id));
+#endif
+
 	const auto mutex = idm::check<lv2_obj, lv2_mutex>(mutex_id, [&](lv2_mutex& mutex)
 	{
 		return mutex.try_lock(ppu);
@@ -343,6 +415,10 @@ error_code sys_mutex_unlock(ppu_thread& ppu, u32 mutex_id)
 	ppu.state += cpu_flag::wait;
 
 	sys_mutex.trace("sys_mutex_unlock(mutex_id=0x%x)", mutex_id);
+
+#ifdef __linux__
+	if (auto native = get_native_mutex(mutex_id)) return pier::native_console_error(native->handle.unlock(ppu.id));
+#endif
 
 	const auto mutex = idm::check<lv2_obj, lv2_mutex>(mutex_id, [&, notify = lv2_obj::notify_all_t()](lv2_mutex& mutex) -> CellError
 	{

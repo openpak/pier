@@ -4,6 +4,7 @@
 #include "sys_mutex.h"
 
 struct lv2_mutex;
+namespace pier { struct native_condition; }
 
 struct sys_cond_attribute_t
 {
@@ -25,6 +26,7 @@ struct lv2_cond final : lv2_obj
 	const u64 key;
 	const u64 name;
 	const u32 mtx_id;
+	std::shared_ptr<pier::native_condition> native;
 
 	lv2_mutex* mutex; // Associated Mutex
 	shared_ptr<lv2_obj> _mutex;

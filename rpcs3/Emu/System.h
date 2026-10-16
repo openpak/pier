@@ -313,6 +313,11 @@ public:
 		return m_db_config ? *m_db_config : empty_db_config;
 	}
 
+	bool IsConfigOverride() const
+	{
+		return m_config_mode == cfg_mode::config_override;
+	}
+
 	bool IsChildProcess() const
 	{
 		return m_config_mode == cfg_mode::continuous;

@@ -532,6 +532,19 @@ error_code _sys_ppu_thread_create(ppu_thread& ppu, vm::ptr<u64> thread_id, vm::p
 		}
 	}
 
+	// Firmware 4.93 libmtp creates this worker detached, but its stop routine
+	// posts an exit event and then joins it before unloading the module. The
+	// detached join otherwise returns EINVAL and the worker resumes in freed
+	// code after its event queue is destroyed. Keep this VSH compatibility
+	// exception local to the observed worker; normal detached threads retain
+	// their LV2 semantics.
+	if (flags == 0 && prio == 3068 && ppu_name == "CellMtpIpLauncher" &&
+		g_ps3_process_info.get_cellos_appname() == "vsh.self")
+	{
+		sys_ppu_thread.notice("Pier VSH libmtp launcher: enabling join before module unload");
+		flags = 1;
+	}
+
 	const u32 tid = idm::import<named_thread<ppu_thread>>([&]()
 	{
 		ppu_thread_params p;

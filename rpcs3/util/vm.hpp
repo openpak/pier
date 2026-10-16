@@ -73,6 +73,7 @@ namespace utils
 		void* m_handle{};
 #else
 		int m_file{};
+		u64 m_offset{};
 #endif
 		u32 m_flags{};
 		u64 m_size{};
@@ -81,6 +82,12 @@ namespace utils
 
 	public:
 		explicit shm(u64 size, u32 flags = 0);
+
+#ifdef __linux__
+		// Map an existing host-memory capability without resizing or clearing it.
+		// Duplicate the descriptor; its caller retains ownership.
+		shm(u64 size, int borrowed_fd, u64 offset);
+#endif
 
 		// Construct with specified path as sparse file storage
 		shm(u64 size, const std::string& storage);

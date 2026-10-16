@@ -1,5 +1,6 @@
 #include "stdafx.h"
 #include "IdManager.h"
+#include "Cell/lv2/native_console_runtime.h"
 
 shared_mutex id_manager::g_mutex;
 
@@ -34,6 +35,35 @@ std::vector<std::pair<u128, id_manager::typeinfo>>& id_manager::get_typeinfo_map
 
 id_manager::id_key* idm::allocate_id(std::span<id_manager::id_key> keys, u32& highest_index, u32 type_id, u32 dst_id, u32 base, u32 step, u32 count, bool uses_lowest_id, std::pair<u32, u32> invl_range)
 {
+#ifdef __linux__
+	// Preserve PPU class/index bits; the shared registry allocates the existing
+	// generation field globally so IDs cannot alias another guest host.
+	if (base == 0x01000000 && step == 1 && count == 100 && invl_range == std::pair<u32, u32>{12, 12})
+	{
+		if (auto& context = g_fxo->get<pier::native_console_context>(); context.kernel)
+		{
+			if (dst_id != (base ? 0 : u32{umax}))
+				fmt::throw_exception("Native console PPU fixed-ID restoration is not supported");
+			// Keep upstream's append-first slot order. Only the generation
+			// namespace is shared; changing slot reuse also changes boot timing.
+			const u32 start = !uses_lowest_id && highest_index < count ? highest_index : 0;
+			if (uses_lowest_id) highest_index = count;
+			for (u32 offset = 0; offset < count; ++offset)
+			{
+				const u32 index = (start + offset) % count;
+				if (keys[index].type() != umax) continue;
+				const auto result = context.kernel->allocate_ppu_thread(index);
+				if (result.code == pier::native_console_sync::status::no_space) continue;
+				if (result.code != pier::native_console_sync::status::ok) return nullptr;
+				highest_index = std::max(highest_index, index + 1);
+				id_manager::g_id = result.id;
+				keys[index] = id_manager::id_key(result.id, type_id);
+				return &keys[index];
+			}
+			return nullptr;
+		}
+	}
+#endif
 	if (dst_id != (base ? 0 : u32{umax}))
 	{
 		// Fixed position construction

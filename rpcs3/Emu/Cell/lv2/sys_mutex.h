@@ -6,6 +6,8 @@
 
 #include "Emu/Cell/PPUThread.h"
 
+namespace pier { struct native_mutex; }
+
 struct sys_mutex_attribute_t
 {
 	be_t<u32> protocol; // SYS_SYNC_FIFO, SYS_SYNC_PRIORITY or SYS_SYNC_PRIORITY_INHERIT
@@ -34,6 +36,7 @@ struct lv2_mutex final : lv2_obj
 	const u32 adaptive;
 	const u64 key;
 	const u64 name;
+	std::shared_ptr<pier::native_mutex> native;
 
 	u32 cond_count = 0; // Condition Variables
 	shared_mutex mutex;

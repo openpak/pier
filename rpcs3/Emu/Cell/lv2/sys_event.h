@@ -6,6 +6,8 @@
 
 #include <deque>
 
+namespace pier { struct native_event; }
+
 class cpu_thread;
 
 // Event Queue Type
@@ -92,6 +94,7 @@ struct lv2_event_queue final : public lv2_obj
 	const u64 key;
 
 	shared_mutex mutex;
+	std::shared_ptr<pier::native_event> native;
 	std::deque<lv2_event> events;
 	spu_thread* sq{};
 	ppu_thread* pq{};
@@ -122,6 +125,7 @@ struct lv2_event_port final : lv2_obj
 	const s32 type; // Port type, either IPC or local
 	const u64 name; // Event source (generated from id and process id if not set)
 
+	std::shared_ptr<pier::native_event> native;
 	atomic_t<usz> is_busy = 0; // Counts threads waiting on event sending
 	shared_ptr<lv2_event_queue> queue; // Event queue this port is connected to
 

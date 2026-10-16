@@ -69,6 +69,7 @@ DYNAMIC_IMPORT("ntdll.dll", NtSetTimerResolution, NTSTATUS(ULONG DesiredResoluti
 #include "util/media_utils.h"
 #include "rpcs3_version.h"
 #include "Emu/System.h"
+#include "Emu/Cell/lv2/sys_process_spawn.h"
 #include "Emu/system_config.h"
 #include "Emu/system_utils.hpp"
 #include "Emu/savestate_utils.hpp"
@@ -1336,13 +1337,26 @@ int run_rpcs3(int argc, char** argv)
 
 		if (!spath.starts_with("%RPCS3_"))
 		{
-			spath = QFileInfo(::at32(args, 0)).absoluteFilePath().toStdString();
+			spath = QFileInfo(QString::fromStdString(spath)).absoluteFilePath().toStdString();
 		}
 
 		// Postpone startup to main event loop
 		Emu.CallFromMainThread([path = std::move(spath), rpcs3_argv = std::move(rpcs3_argv), config_path = std::move(config_path)]() mutable
 		{
 			Emu.argv = std::move(rpcs3_argv);
+#ifdef __linux__
+			// A native guest child boots with VSH's exact argv/envp.
+			if (const char* list = std::getenv("PIER_NATIVE_GUEST_ARGV"))
+			{
+				const char* environment = std::getenv("PIER_NATIVE_GUEST_ENVP");
+				auto guest_argv = pier::decode_spawn_list(list);
+				auto guest_envp = pier::decode_spawn_list(environment ? environment : "");
+				if (!guest_argv || guest_argv->empty() || !guest_envp)
+					report_fatal_error("Invalid native guest arguments");
+				Emu.argv = std::move(*guest_argv);
+				Emu.envp = std::move(*guest_envp);
+			}
+#endif
 			Emu.SetForceBoot(true);
 
 			const cfg_mode config_mode = config_path.empty() ? cfg_mode::custom : cfg_mode::config_override;

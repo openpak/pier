@@ -8,12 +8,40 @@
 #include "sys_memory.h"
 #include "sys_sync.h"
 #include "sys_process.h"
+#include "native_console_runtime.h"
 
+#include <charconv>
+#include <optional>
 #include <span>
 
 #include "util/vm.hpp"
 
 LOG_CHANNEL(sys_mmapper);
+
+namespace
+{
+
+	std::shared_ptr<utils::shm> make_memory_backing(const lv2_memory& memory)
+	{
+#ifdef __linux__
+		static_assert(pier::native_console_memory::sysutil_key == SYS_MMAPPER_SYSUTIL_SHM_KEY);
+		static_assert(pier::native_console_memory::mio_key == SYS_MMAPPER_MIO_SHM_KEY);
+		if (memory.key == SYS_MMAPPER_SYSUTIL_SHM_KEY || memory.key == SYS_MMAPPER_MIO_SHM_KEY)
+		{
+			if (auto& console = g_fxo->get<pier::native_console_context>().memory; console)
+			{
+				const auto region = console->region(memory.key);
+				if (memory.size != region.size)
+					fmt::throw_exception("Native console system-memory size mismatch for key 0x%x", memory.key);
+
+				sys_mmapper.notice("Mapping native console system memory: key=0x%x, size=0x%x, offset=0x%x", memory.key, region.size, region.offset);
+				return std::make_shared<utils::shm>(region.size, region.fd, region.offset);
+			}
+		}
+#endif
+		return std::make_shared<utils::shm>(memory.size, 1 /* shareable flag */);
+	}
+}
 
 void init_system_shared_memory()
 {
@@ -762,7 +790,7 @@ error_code sys_mmapper_map_shared_memory(ppu_thread& ppu, u32 addr, u32 mem_id, 
 			// Insert atomically the memory handle (laziliy allocated)
 			if (!to_insert)
 			{
-				to_insert = make_single_value(std::make_shared<utils::shm>(mem.size, 1 /* shareable flag */));
+				to_insert = make_single_value(make_memory_backing(mem));
 			}
 
 			null.reset();
@@ -837,7 +865,7 @@ error_code sys_mmapper_search_and_map(ppu_thread& ppu, u32 start_addr, u32 mem_i
 			// Insert atomically the memory handle (laziliy allocated)
 			if (!to_insert)
 			{
-				to_insert = make_single_value(std::make_shared<utils::shm>(mem.size, 1 /* shareable flag */));
+				to_insert = make_single_value(make_memory_backing(mem));
 			}
 
 			null.reset();

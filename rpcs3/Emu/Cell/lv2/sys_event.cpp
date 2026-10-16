@@ -1,5 +1,6 @@
 #include "stdafx.h"
 #include "sys_event.h"
+#include "native_console_runtime.h"
 
 #include "Emu/IdManager.h"
 #include "Emu/IPC.h"
@@ -15,6 +16,21 @@
 #include "util/asm.hpp"
 
 LOG_CHANNEL(sys_event);
+
+#ifdef __linux__
+static std::shared_ptr<pier::native_event> get_native_event(u32 id)
+{
+	if (!g_fxo->get<pier::native_console_context>().kernel) return {};
+	const auto object = idm::get<lv2_obj, lv2_event_queue>(id, [](lv2_event_queue& queue) { return queue.native; });
+	return object ? object.ret : nullptr;
+}
+static bool native_port_connected(const lv2_event_port& port)
+{
+	return port.native && port.native->handle.alive() == pier::native_console_sync::status::ok;
+}
+#else
+static bool native_port_connected(const lv2_event_port&) { return false; }
+#endif
 
 // Pier: ntm event queue of the firmware (see sys_net.cpp), traffic on it is logged
 extern atomic_t<u32> g_pier_ntm_queue;
@@ -43,12 +59,17 @@ lv2_event_queue::lv2_event_queue(utils::serial& ar) noexcept
 
 std::function<void(void*)> lv2_event_queue::load(utils::serial& ar)
 {
+#ifdef __linux__
+	if (g_fxo->get<pier::native_console_context>().kernel)
+		fmt::throw_exception("Native console event savestate restoration is not supported");
+#endif
 	auto queue = make_shared<lv2_event_queue>(stx::exact_t<utils::serial&>(ar));
 	return [ptr = lv2_obj::load(queue->key, queue)](void* storage) { *static_cast<atomic_ptr<lv2_obj>*>(storage) = ptr; };
 }
 
 void lv2_event_queue::save(utils::serial& ar)
 {
+	if (native) fmt::throw_exception("Native console event savestates are not supported");
 	ar(protocol, type, size, name, key, events);
 }
 
@@ -107,6 +128,7 @@ lv2_event_port::lv2_event_port(utils::serial& ar)
 
 void lv2_event_port::save(utils::serial& ar)
 {
+	if (native) fmt::throw_exception("Native console event port savestates are not supported");
 	ar(type, name);
 
 	lv2_event_queue::save_ptr(ar, queue.get());
@@ -131,6 +153,15 @@ CellError lv2_event_queue::send(lv2_event event, bool* notified_thread, lv2_even
 	{
 		*notified_thread = false;
 	}
+
+#ifdef __linux__
+	if (native)
+	{
+		const auto [source, d1, d2, d3] = event;
+		const auto result = native->handle.send({source, d1, d2, d3});
+		return result == pier::native_console_sync::status::not_found ? CellError{CELL_ENOTCONN} : pier::native_console_error(result);
+	}
+#endif
 
 	struct notify_spus_t 
 	{
@@ -243,6 +274,7 @@ error_code sys_event_queue_create(cpu_thread& cpu, vm::ptr<u32> equeue_id, vm::p
 		return CELL_EINVAL;
 	}
 
+	if (!equeue_id || !attr) return CELL_EFAULT;
 	const u32 protocol = attr->protocol;
 
 	if (protocol != SYS_SYNC_FIFO && protocol != SYS_SYNC_PRIORITY)
@@ -262,10 +294,24 @@ error_code sys_event_queue_create(cpu_thread& cpu, vm::ptr<u32> equeue_id, vm::p
 	const u32 pshared = ipc_key == SYS_EVENT_QUEUE_LOCAL ? SYS_SYNC_NOT_PROCESS_SHARED : SYS_SYNC_PROCESS_SHARED;
 	constexpr u32 flags = SYS_SYNC_NEWLY_CREATED;
 	const u64 name = attr->name_u64;
+	std::shared_ptr<pier::native_event> native;
+#ifdef __linux__
+	if (ipc_key && g_fxo->get<pier::native_console_context>().kernel)
+	{
+		if (type != SYS_PPU_QUEUE) return CELL_ENOSYS;
+		auto result = g_fxo->get<pier::native_console_context>().kernel->open_event(ipc_key,
+			pier::native_console_sync::open_mode::create, static_cast<pier::native_console_sync::protocol>(protocol), size);
+		if (result.code != pier::native_console_sync::status::ok) return pier::native_console_error(result.code);
+		native = std::make_shared<pier::native_event>(std::move(*result.handle));
+		sys_event.notice("Native console event queue created: IPC=0x%016x", ipc_key);
+	}
+#endif
 
 	if (const auto error = lv2_obj::create<lv2_event_queue>(pshared, ipc_key, flags, [&]()
 	{
-		return make_shared<lv2_event_queue>(protocol, type, size, name, ipc_key);
+		auto queue = make_shared<lv2_event_queue>(protocol, type, size, name, ipc_key);
+		queue->native = native;
+		return queue;
 	}))
 	{
 		return error;
@@ -312,6 +358,16 @@ error_code sys_event_queue_destroy(ppu_thread& ppu, u32 equeue_id, s32 mode)
 	const auto queue = idm::withdraw<lv2_obj, lv2_event_queue>(equeue_id, [&](lv2_event_queue& queue) -> CellError
 	{
 		qlock = std::unique_lock{queue.mutex};
+#ifdef __linux__
+		if (queue.native)
+		{
+			const auto result = queue.native->handle.destroy(mode == SYS_EVENT_QUEUE_DESTROY_FORCE);
+			if (result != pier::native_console_sync::status::ok) return pier::native_console_error(result);
+			lv2_obj::on_id_destroy(queue, queue.key);
+			qlock.unlock();
+			return {};
+		}
+#endif
 
 		head = queue.type == SYS_PPU_QUEUE ? static_cast<cpu_thread*>(+queue.pq) : +queue.sq;
 
@@ -435,6 +491,21 @@ error_code sys_event_queue_tryreceive(ppu_thread& ppu, u32 equeue_id, vm::ptr<sy
 
 	sys_event.trace("sys_event_queue_tryreceive(equeue_id=0x%x, event_array=*0x%x, size=%d, number=*0x%x)", equeue_id, event_array, size, number);
 
+	if (size < 0 || size > 127) return CELL_EINVAL;
+	if (!number || (size && !event_array)) return CELL_EFAULT;
+#ifdef __linux__
+	if (auto native = get_native_event(equeue_id))
+	{
+		std::array<pier::native_console_sync::event, 127> batch{};
+		std::size_t count = 0;
+		const auto result = native->handle.try_receive(std::span{batch}.first(size), count);
+		if (result != pier::native_console_sync::status::ok) return pier::native_console_error(result);
+		ppu.check_state();
+		for (std::size_t i = 0; i < count; ++i) event_array[i] = {batch[i].source, batch[i].data1, batch[i].data2, batch[i].data3};
+		*number = static_cast<u32>(count);
+		return CELL_OK;
+	}
+#endif
 	const auto queue = idm::get_unlocked<lv2_obj, lv2_event_queue>(equeue_id);
 
 	if (!queue)
@@ -485,6 +556,30 @@ error_code sys_event_queue_receive(ppu_thread& ppu, u32 equeue_id, vm::ptr<sys_e
 		sys_event.notice("ntm queue 0x%x: receive (timeout=0x%llx)", equeue_id, timeout);
 	}
 
+#ifdef __linux__
+	if (auto native = get_native_event(equeue_id))
+	{
+		pier::native_console_sync::event event{};
+		bool stopped = false;
+		lv2_obj::sleep(ppu);
+		const auto result = native->handle.receive(ppu.id, ppu.prio.load().prio, timeout, event, [&]
+		{
+			stopped = is_stopped(+ppu.state);
+			return stopped;
+		});
+		if (result == pier::native_console_sync::status::cancelled && stopped)
+		{
+			ppu.state += cpu_flag::again;
+			return {};
+		}
+		lv2_obj::awake(&ppu);
+		ppu.state -= cpu_flag::signal;
+		ppu.check_state();
+		if (result != pier::native_console_sync::status::ok) return pier::native_console_error(result);
+		std::tie(ppu.gpr[4], ppu.gpr[5], ppu.gpr[6], ppu.gpr[7]) = std::tuple{event.source, event.data1, event.data2, event.data3};
+		return CELL_OK;
+	}
+#endif
 	ppu.gpr[3] = CELL_OK;
 
 	const auto queue = idm::get<lv2_obj, lv2_event_queue>(equeue_id, [&, notify = lv2_obj::notify_all_t()](lv2_event_queue& queue) -> CellError
@@ -622,6 +717,9 @@ error_code sys_event_queue_drain(ppu_thread& ppu, u32 equeue_id)
 
 	sys_event.trace("sys_event_queue_drain(equeue_id=0x%x)", equeue_id);
 
+#ifdef __linux__
+	if (auto native = get_native_event(equeue_id)) return pier::native_console_error(native->handle.drain());
+#endif
 	const auto queue = idm::check<lv2_obj, lv2_event_queue>(equeue_id, [&](lv2_event_queue& queue)
 	{
 		std::lock_guard lock(queue.mutex);
@@ -667,7 +765,7 @@ error_code sys_event_port_destroy(ppu_thread& ppu, u32 eport_id)
 
 	const auto port = idm::withdraw<lv2_obj, lv2_event_port>(eport_id, [](lv2_event_port& port) -> CellError
 	{
-		if (lv2_obj::check(port.queue))
+		if (lv2_obj::check(port.queue) || native_port_connected(port))
 		{
 			return CELL_EISCONN;
 		}
@@ -709,11 +807,12 @@ error_code sys_event_port_connect_local(cpu_thread& cpu, u32 eport_id, u32 equeu
 		return CELL_EINVAL;
 	}
 
-	if (lv2_obj::check(port->queue))
+	if (lv2_obj::check(port->queue) || native_port_connected(*port))
 	{
 		return CELL_EISCONN;
 	}
 
+	port->native.reset();
 	port->queue = std::move(queue);
 
 	return CELL_OK;
@@ -730,6 +829,22 @@ error_code sys_event_port_connect_ipc(ppu_thread& ppu, u32 eport_id, u64 ipc_key
 		return CELL_EINVAL;
 	}
 
+#ifdef __linux__
+	if (auto& kernel = g_fxo->get<pier::native_console_context>().kernel; kernel && !lv2_event_queue::find(ipc_key))
+	{
+		auto result = kernel->open_event(ipc_key, pier::native_console_sync::open_mode::open);
+		if (result.code != pier::native_console_sync::status::ok) return pier::native_console_error(result.code);
+		auto native = std::make_shared<pier::native_event>(std::move(*result.handle));
+		std::lock_guard lock(id_manager::g_mutex);
+		const auto port = idm::check_unlocked<lv2_obj, lv2_event_port>(eport_id);
+		if (!port) return CELL_ESRCH;
+		if (port->type != SYS_EVENT_PORT_IPC) return CELL_EINVAL;
+		if (lv2_obj::check(port->queue) || native_port_connected(*port)) return CELL_EISCONN;
+		port->queue.reset();
+		port->native = std::move(native);
+		return CELL_OK;
+	}
+#endif
 	auto queue = lv2_event_queue::find(ipc_key);
 
 	std::lock_guard lock(id_manager::g_mutex);
@@ -746,11 +861,12 @@ error_code sys_event_port_connect_ipc(ppu_thread& ppu, u32 eport_id, u64 ipc_key
 		return CELL_EINVAL;
 	}
 
-	if (lv2_obj::check(port->queue))
+	if (lv2_obj::check(port->queue) || native_port_connected(*port))
 	{
 		return CELL_EISCONN;
 	}
 
+	port->native.reset();
 	port->queue = std::move(queue);
 
 	return CELL_OK;
@@ -771,7 +887,7 @@ error_code sys_event_port_disconnect(ppu_thread& ppu, u32 eport_id)
 		return CELL_ESRCH;
 	}
 
-	if (!lv2_obj::check(port->queue))
+	if (!(lv2_obj::check(port->queue) || native_port_connected(*port)))
 	{
 		return CELL_ENOTCONN;
 	}
@@ -782,6 +898,7 @@ error_code sys_event_port_disconnect(ppu_thread& ppu, u32 eport_id)
 	}
 
 	port->queue.reset();
+	port->native.reset();
 
 	return CELL_OK;
 }
@@ -809,6 +926,14 @@ error_code sys_event_port_send(u32 eport_id, u64 data1, u64 data2, u64 data3)
 			return {};
 		}
 
+#ifdef __linux__
+		if (port.native)
+		{
+			const u64 source = port.name ? port.name : (u64{process_getpid() + 0u} << 32) | u64{eport_id};
+			const auto result = port.native->handle.send({source, data1, data2, data3});
+			return result == pier::native_console_sync::status::not_found ? CellError{CELL_ENOTCONN} : pier::native_console_error(result);
+		}
+#endif
 		if (lv2_obj::check(port.queue))
 		{
 			const u64 source = port.name ? port.name : (u64{process_getpid() + 0u} << 32) | u64{eport_id};

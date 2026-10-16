@@ -1,4 +1,5 @@
 #include "stdafx.h"
+#include "lv2/native_console_runtime.h"
 #include "Utilities/JIT.h"
 #include "Utilities/StrUtil.h"
 #include "util/serialization.hpp"
@@ -2813,6 +2814,10 @@ void ppu_thread::exec_task()
 
 ppu_thread::~ppu_thread()
 {
+#ifdef __linux__
+	if (auto* context = g_fxo->try_get<pier::native_console_context>(); context && context->kernel)
+		context->kernel->release_ppu_thread(id);
+#endif
 }
 
 ppu_thread::ppu_thread(const ppu_thread_params& param, std::string_view name, u32 _prio, int detached)

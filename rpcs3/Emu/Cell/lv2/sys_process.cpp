@@ -1,9 +1,12 @@
 #include "stdafx.h"
 #include "sys_process.h"
+#include "sys_process_spawn.h"
+#include "native_console_runtime.h"
 #include "Emu/Memory/vm_ptr.h"
 #include "Emu/System.h"
 #include "Emu/VFS.h"
 #include "Emu/IdManager.h"
+#include "Emu/Io/interception.h"
 
 #include "Crypto/unedat.h"
 #include "Emu/Cell/ErrorCodes.h"
@@ -61,19 +64,26 @@ ps3_process_info_t g_ps3_process_info;
 
 s32 process_getpid()
 {
-	// TODO: get current process id
+#ifdef __linux__
+	if (const auto& context = g_fxo->get<pier::native_console_context>(); context.kernel)
+		return static_cast<s32>(context.guest_pid);
+#endif
 	return 1;
 }
 
 s32 sys_process_getpid()
 {
-	sys_process.trace("sys_process_getpid() -> 1");
+	sys_process.trace("sys_process_getpid() -> %d", process_getpid());
 	return process_getpid();
 }
 
 s32 sys_process_getppid()
 {
-	sys_process.todo("sys_process_getppid() -> 0");
+#ifdef __linux__
+	if (const auto& context = g_fxo->get<pier::native_console_context>(); context.kernel)
+		return static_cast<s32>(context.parent_pid);
+#endif
+	sys_process.trace("sys_process_getppid() -> 0");
 	return 0;
 }
 
@@ -343,10 +353,61 @@ error_code sys_process_wait_for_child(u32 pid, vm::ptr<u32> status, u64 unk)
 	return CELL_OK;
 }
 
-error_code sys_process_wait_for_child2(u64 unk1, u64 unk2, u64 unk3, u64 unk4, u64 unk5, u64 unk6)
+#ifdef __linux__
+// A native guest child host exists only for its guest.
+static bool native_child_host()
 {
-	sys_process.todo("sys_process_wait_for_child2(unk1=0x%llx, unk2=0x%llx, unk3=0x%llx, unk4=0x%llx, unk5=0x%llx, unk6=0x%llx)",
-		unk1, unk2, unk3, unk4, unk5, unk6);
+	const auto& context = g_fxo->get<pier::native_console_context>();
+	return context.kernel && context.parent_pid;
+}
+
+static void quit_native_child_host()
+{
+	Emu.after_kill_callback = [] { Emu.Quit(true); };
+	Emu.Kill(false);
+}
+#endif
+
+// VSH's game monitor (vsh.self 0x609d40) passes a 0x2400-byte exitspawn
+// buffer; a zero data_size is a plain exit and returns VSH to the XMB.
+error_code sys_process_wait_for_child2(ppu_thread& ppu, vm::ptr<u32> pid, vm::ptr<u32> status, vm::ptr<void> data, u32 data_capacity, vm::ptr<u32> data_size, u64 flags)
+{
+	sys_process.warning("sys_process_wait_for_child2(pid=*0x%x, status=*0x%x, data=*0x%x, data_capacity=0x%x, data_size=*0x%x, flags=0x%llx)",
+		pid, status, data, data_capacity, data_size, flags);
+#ifdef __linux__
+	if (auto& context = g_fxo->get<pier::native_console_context>(); context.kernel)
+	{
+		if (!vm::check_addr(pid.addr(), vm::page_readable, 4) || !vm::check_addr(data_size.addr(), vm::page_writable, 4) ||
+			(status && !vm::check_addr(status.addr(), vm::page_writable, 4)))
+			return CELL_EFAULT;
+		const u32 child = *pid;
+		lv2_obj::sleep(ppu);
+		const auto result = context.children->wait(child, [&] { return is_stopped(+ppu.state); });
+		if (result.error == ECANCELED)
+		{
+			ppu.state += cpu_flag::again;
+			return {};
+		}
+		lv2_obj::awake(&ppu);
+		ppu.state -= cpu_flag::signal;
+		ppu.check_state();
+		if (result.error)
+			return CELL_ESRCH;
+		const bool exited = result.info.state == pier::native_console_sync::guest_state::exited;
+		if (exited)
+			sys_process.success("Native guest child %u exited with status %d", child, result.info.exit_status);
+		else
+			sys_process.error("Native guest child %u ended without guest exit (host wait status 0x%x)", child, result.host_status);
+		// ponytail: LV2's status for a crashed child is unknown and VSH does not read it; -1 marks a host failure.
+		if (status)
+			*status = exited ? result.info.exit_status : -1;
+		*data_size = 0; // Exitspawn chaining back through VSH is not implemented.
+		if (!context.children->running())
+			Emu.CallFromMainThread([] { input::SetIntercepted(false); });
+		return CELL_OK;
+	}
+#endif
+	sys_process.todo("sys_process_wait_for_child2: no native console");
 	return CELL_OK;
 }
 
@@ -370,11 +431,19 @@ void _sys_process_exit(ppu_thread& ppu, s32 status, u32 arg2, u32 arg3)
 	ppu.state += cpu_flag::wait;
 
 	sys_process.warning("_sys_process_exit(status=%d, arg2=0x%x, arg3=0x%x)", status, arg2, arg3);
+#ifdef __linux__
+	if (auto& context = g_fxo->get<pier::native_console_context>(); context.kernel)
+		context.kernel->finish_guest(status);
+#endif
 
 	Emu.CallFromMainThread([]()
 	{
 		sys_process.success("Process finished");
 		signal_system_cache_can_stay();
+#ifdef __linux__
+		if (native_child_host())
+			return quit_native_child_host();
+#endif
 		Emu.Kill();
 	});
 
@@ -438,6 +507,16 @@ void lv2_exitspawn(ppu_thread& ppu, std::vector<std::string>& argv, std::vector<
 	// sys_sm_shutdown
 	const bool is_real_reboot = (ppu.gpr[11] == 379);
 
+#ifdef __linux__
+	if (native_child_host())
+	{
+		// Booting another title inside the child host would register a second
+		// guest; until the data returns through VSH's wait, end as a host failure.
+		sys_process.error("Native guest child exitspawn -> %s is not supported", argv[0]);
+		Emu.CallFromMainThread([] { quit_native_child_host(); });
+	}
+	else
+#endif
 	Emu.CallFromMainThread([is_real_reboot, argv = std::move(argv), envp = std::move(envp), data = std::move(data)]() mutable
 	{
 		sys_process.success("Process finished -> %s", argv[0]);
@@ -548,10 +627,160 @@ void sys_process_exit3(ppu_thread& ppu, s32 status)
 	return _sys_process_exit(ppu, status, 0, 0);
 }
 
-error_code sys_process_spawns_a_self2(vm::ptr<u32> pid, u32 primary_prio, u64 flags, vm::ptr<void> stack, u32 stack_size, u32 mem_id, vm::ptr<void> param_sfo, vm::ptr<void> dbg_data)
+#ifdef __linux__
+extern char** environ;
+
+// The game runs as a separate Pier host with its own guest address space,
+// while VSH and its native services keep running. The child owns rendering
+// (its own window) and input; VSH's input is intercepted until it is reaped.
+static error_code native_game_spawn(pier::native_console_context& context, std::vector<std::string> argv, const std::vector<std::string>& envp, u32& pid)
+{
+	const std::string path = vfs::get(argv.front());
+	if (path.empty() || !fs::is_file(path))
+		return CELL_ENOENT;
+	std::vector<std::string> arguments{Emu.IsHeadless() ? "--headless" : "--no-gui"};
+	// A firmware-wide override (isolated probes) applies to the title too;
+	// otherwise the child loads the title's own custom configuration.
+	if (Emu.IsConfigOverride())
+		arguments.insert(arguments.end(), {"--config", Emu.GetUsedConfig()});
+	arguments.push_back(path);
+	std::vector<std::string> environment;
+	for (auto entry = environ; *entry; ++entry)
+		if (!std::string_view{*entry}.starts_with("XDG_CACHE_HOME=") && !std::string_view{*entry}.starts_with("PIER_NATIVE_GUEST_"))
+			environment.emplace_back(*entry);
+	// RPCS3 holds a single-instance lock and its log in the cache directory.
+	environment.push_back("XDG_CACHE_HOME=" + fs::get_cache_dir() + "pier-game");
+	argv.front().clear(); // Load regenerates it from the booted path.
+	environment.push_back("PIER_NATIVE_GUEST_ARGV=" + pier::encode_spawn_list(argv));
+	environment.push_back("PIER_NATIVE_GUEST_ENVP=" + pier::encode_spawn_list(envp));
+	const auto result = context.children->spawn("/proc/self/exe", std::move(arguments), std::move(environment));
+	if (result.error)
+	{
+		sys_process.error("Native game spawn failed: %s (errno=%d)", path, result.error);
+		return result.error == EAGAIN ? CELL_EAGAIN : CELL_ENOEXEC;
+	}
+	sys_process.success("Native game child %u -> %s", result.pid, path);
+	pid = result.pid;
+	Emu.CallFromMainThread([] { input::SetIntercepted(true); });
+	return CELL_OK;
+}
+#endif
+
+// Isolated diagnostic: launching from the XMB needs input, which probes never
+// send. When VSH creates its packet transport (producer channel 0 mutex), start
+// PIER_NATIVE_DIAG_GAME through the same child path; VSH's monitor is unaware.
+void pier_native_diag_game()
+{
+#ifdef __linux__
+	auto& context = g_fxo->get<pier::native_console_context>();
+	const char* game = std::getenv("PIER_NATIVE_DIAG_GAME");
+	if (!game || !context.kernel || context.parent_pid)
+		return;
+	// PIER_NATIVE_DIAG_DELAY=<seconds> separates child attach from VSH boot.
+	// ponytail: detached sleeper; a probe must outlive the delay or it touches a stopped emulator.
+	const char* delay = std::getenv("PIER_NATIVE_DIAG_DELAY");
+	std::thread([&context, game = std::string{game}, seconds = delay ? std::atoi(delay) : 0]
+	{
+		std::this_thread::sleep_for(std::chrono::seconds(seconds));
+		u32 child = 0;
+		sys_process.warning("Diagnostic native game spawn after %ds: %s", seconds, native_game_spawn(context, {game}, {}, child));
+	}).detach();
+#endif
+}
+
+error_code sys_process_spawns_a_self2(ppu_thread& ppu, vm::ptr<u32> pid, u32 primary_prio, u64 flags, vm::ptr<void> stack, u32 stack_size, u32 mem_id, vm::ptr<void> param_sfo, vm::ptr<void> dbg_data)
 {
 	sys_process.todo("sys_process_spawns_a_self2(pid=*0x%x, primary_prio=0x%x, flags=0x%llx, stack=*0x%x, stack_size=0x%x, mem_id=0x%x, param_sfo=*0x%x, dbg_data=*0x%x"
 		, pid, primary_prio, flags, stack, stack_size, mem_id, param_sfo, dbg_data);
+
+	// Pier currently runs one guest process. Support the XMB's installed-game
+	// launch as a process handoff, without pretending that a child PID exists.
+	// Other VSH helpers (e.g. background media workers) still follow the upstream
+	// path below; they must not replace the firmware process.
+#ifdef __linux__
+	auto& context = g_fxo->get<pier::native_console_context>();
+#endif
+	if (g_ps3_process_info.get_cellos_appname() == "vsh.self" && primary_prio == 1001)
+	{
+		// Replacing VSH destroys the native services required by the game.
+		// Keep this old offline launch path out of normal firmware operation.
+		const char* offline_handoff = std::getenv("PIER_ALLOW_OFFLINE_HANDOFF");
+		const bool native =
+#ifdef __linux__
+			context.kernel != nullptr;
+#else
+			false;
+#endif
+		if (!native && (!offline_handoff || std::string_view{offline_handoff} != "1"))
+		{
+			sys_process.error("Native game launch requires preserved firmware services; offline replacement is disabled");
+			return CELL_ENOSYS;
+		}
+		if (!pid || !vm::check_addr(pid.addr(), vm::page_writable, sizeof(u32)) ||
+			stack_size < 24 || stack_size > 0x10000 ||
+			!vm::check_addr(stack.addr(), vm::page_readable, stack_size))
+		{
+			return CELL_EFAULT;
+		}
+
+		auto arguments = pier::decode_spawn_arguments(
+			{vm::cptr<u8>::make(stack.addr()).get_ptr(), stack_size}, stack.addr());
+		if (!arguments)
+			return CELL_EINVAL;
+		auto argv = std::move(arguments->argv);
+		auto envp = std::move(arguments->envp);
+
+		if (argv.empty() || !argv.front().starts_with("/dev_hdd0/game/") ||
+			!argv.front().ends_with("/USRDIR/EBOOT.BIN"))
+		{
+			return CELL_ENOSYS;
+		}
+
+#ifdef __linux__
+		if (native)
+		{
+			u32 child = 0;
+			const error_code result = native_game_spawn(context, std::move(argv), envp, child);
+			if (result == CELL_OK)
+				*pid = child;
+			return result;
+		}
+#endif
+		const std::string path = vfs::get(argv.front());
+		if (path.empty() || !fs::is_file(path))
+			return CELL_ENOENT;
+
+		ppu.state += cpu_flag::wait;
+		Emu.CallFromMainThread([path, argv = std::move(argv), envp = std::move(envp)]() mutable
+		{
+			sys_process.success("Pier XMB installed-game handoff -> %s", argv.front());
+			Emu.after_kill_callback = [path, argv = std::move(argv), envp = std::move(envp),
+				config = Emu.GetUsedConfig(), db_config = Emu.GetUsedDatabaseConfig()]() mutable
+			{
+				Emu.argv = std::move(argv);
+				Emu.envp = std::move(envp);
+				// A new title needs its own game directory. Load derives that
+				// directory only when it generates argv[0]; keeping VSH's supplied
+				// path here otherwise retains /dev_flash/vsh/module/ for assets
+				// and trophies. Regenerate the equivalent path from the validated
+				// host executable, preserving all remaining arguments.
+				Emu.argv.front().clear();
+				Emu.SetForceBoot(true);
+				const auto result = Emu.BootGame(path, "", true, cfg_mode::continuous, config, db_config);
+				if (result != game_boot_result::no_errors)
+					sys_process.error("Pier XMB handoff failed: %s (%s)", path, result);
+			};
+			Emu.SetContinuousMode(true);
+			Emu.Kill(false);
+		});
+
+		while (auto state = +ppu.state)
+		{
+			if (is_stopped(state))
+				break;
+			ppu.state.wait(state);
+		}
+	}
 
 	return CELL_OK;
 }
