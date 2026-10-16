@@ -1875,6 +1875,17 @@ game_boot_result Emulator::Load(const std::string& title_id, bool is_disc_patch,
 				g_cfg.audio.provider.set(audio_provider::cell_audio);
 			}
 
+			// Firmware 4.93 VSH has a lock-order cycle between its main thread
+			// (prio 900) and the libavset HDMI handler (prio 500), both woken by
+			// one HDCP event. LV2 runs them in priority order; two concurrent
+			// emulated slots let main win and deadlock boot (5/6 boots stalled,
+			// 0/6 with one slot). Games run as separate hosts with their own value.
+			if (from_dev_flash && m_path.ends_with("/vsh/module/vsh.self") && g_cfg.core.ppu_threads != 1)
+			{
+				sys_log.warning("VSH boot: PPU Threads %d -> 1 (priority-ordered firmware startup)", g_cfg.core.ppu_threads.get());
+				g_cfg.core.ppu_threads.set(1);
+			}
+
 			// Backup config
 			g_backup_cfg.from_string(g_cfg.to_string());
 		}
