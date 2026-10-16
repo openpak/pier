@@ -1199,6 +1199,11 @@ static game_boot_result check_disc_key(const std::string& path)
 	return game_boot_result::disc_key_missing;
 }
 
+bool pier_boots_firmware()
+{
+	return Emu.GetBoot().ends_with("/vsh/module/vsh.self");
+}
+
 game_boot_result Emulator::Load(const std::string& title_id, bool is_disc_patch, usz recursion_count)
 {
 	if (recursion_count == 0 && m_restrict_emu_state_change)

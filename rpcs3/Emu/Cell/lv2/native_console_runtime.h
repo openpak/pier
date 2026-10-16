@@ -4,6 +4,9 @@
 #include "native_console_child.h"
 #include "Emu/Cell/ErrorCodes.h"
 
+// True when this host boots the firmware (dev_flash vsh.self); defined in System.cpp.
+bool pier_boots_firmware();
+
 namespace pier
 {
 struct native_mutex
@@ -42,13 +45,23 @@ struct native_console_context
 	native_console_context()
 	{
 		const char* value = std::getenv("PIER_NATIVE_CONSOLE_FD");
-		if (!value || !*value) return;
-		const std::string_view text{value};
-		int fd = -1;
-		const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), fd);
-		if (error != std::errc{} || end != text.data() + text.size() || fd < 0)
-			fmt::throw_exception("Invalid PIER_NATIVE_CONSOLE_FD descriptor");
-		memory.emplace(native_console_memory::attach(fd, &fail));
+		if (!value || !*value)
+		{
+			// The normal boot: firmware owns a console of its own and games it
+			// launches join it as child hosts. PIER_NATIVE_CONSOLE=0 opts out.
+			const char* mode = std::getenv("PIER_NATIVE_CONSOLE");
+			if ((mode && std::string_view{mode} == "0") || !pier_boots_firmware()) return;
+			memory.emplace(native_console_memory::create(&fail));
+		}
+		else
+		{
+			const std::string_view text{value};
+			int fd = -1;
+			const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), fd);
+			if (error != std::errc{} || end != text.data() + text.size() || fd < 0)
+				fmt::throw_exception("Invalid PIER_NATIVE_CONSOLE_FD descriptor");
+			memory.emplace(native_console_memory::attach(fd, &fail));
+		}
 		kernel = std::make_unique<native_console_sync>(*memory, &fail);
 		native_console_sync::guest_result registered{};
 		if (const char* token_text = std::getenv("PIER_NATIVE_GUEST_TOKEN"))
