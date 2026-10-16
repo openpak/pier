@@ -644,12 +644,11 @@ static error_code native_game_spawn(pier::native_console_context& context, std::
 	if (Emu.IsConfigOverride())
 		arguments.insert(arguments.end(), {"--config", Emu.GetUsedConfig()});
 	arguments.push_back(path);
+	// The child shares this host's caches; it takes its own lock and log (rpcs3.cpp).
 	std::vector<std::string> environment;
 	for (auto entry = environ; *entry; ++entry)
-		if (!std::string_view{*entry}.starts_with("XDG_CACHE_HOME=") && !std::string_view{*entry}.starts_with("PIER_NATIVE_GUEST_"))
+		if (!std::string_view{*entry}.starts_with("PIER_NATIVE_GUEST_"))
 			environment.emplace_back(*entry);
-	// RPCS3 holds a single-instance lock and its log in the cache directory.
-	environment.push_back("XDG_CACHE_HOME=" + fs::get_cache_dir() + "pier-game");
 	argv.front().clear(); // Load regenerates it from the booted path.
 	environment.push_back("PIER_NATIVE_GUEST_ARGV=" + pier::encode_spawn_list(argv));
 	environment.push_back("PIER_NATIVE_GUEST_ENVP=" + pier::encode_spawn_list(envp));
