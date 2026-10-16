@@ -4843,6 +4843,8 @@ extern void ppu_initialize()
 
 	if (compile_fw || dev_flash_located)
 	{
+		bool firmware_cached = false;
+
 		if (dev_flash_located)
 		{
 			const std::string eseibrd = mount_point + "/vsh/module/eseibrd.sprx";
@@ -4851,11 +4853,18 @@ extern void ppu_initialize()
 			{
 				// Check if cache exists for this infinitesimally small prx
 				dev_flash_located = ppu_initialize(*prx, true);
+				firmware_cached = !dev_flash_located;
 			}
 		}
 
-		const std::string firmware_sprx_path = vfs::get(dev_flash_located ? "/dev_flash/"sv : "/dev_flash/sys/external/"sv);
-		dir_queue.emplace_back(firmware_sprx_path);
+		// Pier boots the firmware on every run: once its cache exists, modules load
+		// from it when VSH uses them instead of sweeping /dev_flash/sys/external each
+		// boot. An explicit firmware compile still queues everything.
+		if (compile_fw || !firmware_cached)
+		{
+			const std::string firmware_sprx_path = vfs::get(dev_flash_located ? "/dev_flash/"sv : "/dev_flash/sys/external/"sv);
+			dir_queue.emplace_back(firmware_sprx_path);
+		}
 	}
 
 	// Avoid compilation if main's cache exists or it is a standalone SELF with no PARAM.SFO
