@@ -1891,6 +1891,22 @@ game_boot_result Emulator::Load(const std::string& title_id, bool is_disc_patch,
 				g_cfg.core.ppu_threads.set(1);
 			}
 
+#ifdef __linux__
+			// A game spawned by VSH asks the firmware for network/PSN state over
+			// sysutil IPC, like a real PS3; the HLE versions answer "offline".
+			if (std::getenv("PIER_NATIVE_GUEST_ARGV"))
+			{
+				auto libs = g_cfg.core.libraries_control.get_set();
+				for (std::string lib : {"libsysutil.sprx", "libsysutil_np.sprx", "libsysutil_np2.sprx", "libnetctl.sprx"})
+				{
+					libs.erase(lib + ":hle");
+					libs.emplace(lib + ":lle");
+				}
+				g_cfg.core.libraries_control.set_set(std::move(libs));
+				sys_log.warning("Native game child: firmware sysutil/NP/netctl libraries (LLE)");
+			}
+#endif
+
 			// Backup config
 			g_backup_cfg.from_string(g_cfg.to_string());
 		}

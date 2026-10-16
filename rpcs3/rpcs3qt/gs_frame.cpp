@@ -47,6 +47,7 @@
 #endif
 #ifdef HAVE_X11
 #include <X11/Xlib.h>
+#undef KeyPress // Xlib macro; this file means QEvent::KeyPress
 #endif
 #endif
 
@@ -1298,6 +1299,16 @@ bool gs_frame::event(QEvent* ev)
 			// Do not propagate the close event. It will be closed by the rsx_thread.
 			return true;
 		}
+	}
+	else if (ev->type() == QEvent::KeyPress && static_cast<QKeyEvent*>(ev)->key() == Qt::Key_F8 && qEnvironmentVariableIsSet("PIER_NATIVE_GUEST_ARGV"))
+	{
+		// OpenPak's shared return-to-home key: quit the game; VSH's wait returns it to the XMB.
+		if (!Emu.IsStopped())
+		{
+			gui_log.notice("F8: quitting the game back to the firmware");
+			Emu.GracefulShutdown(true, true);
+		}
+		return true;
 	}
 #ifdef HAVE_X11
 	else if (ev->type() == QEvent::Resize && !m_embedded && QGuiApplication::platformName() == "xcb")
