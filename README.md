@@ -13,8 +13,16 @@ presented as endorsed by the RPCS3 project. The original README is kept in
 
 ## Status
 
-Phase 0: fork created, nothing OpenPak-specific built or booted yet.
-Plan and gate 1: `docs/ps3/pier-base-plan.md` in the OpenPak docs repo.
+Firmware 4.93 boots and native OpenPak account/profile integration has been
+exercised. Native game networking is incomplete: firmware services and IPC must
+survive game launch. The old single-process replacement launch is disabled by
+default; `PIER_ALLOW_OFFLINE_HANDOFF=1` enables it only for offline diagnostics.
+With the native console descriptor (Linux), a VSH game launch instead starts the
+game as a separate Pier host while VSH keeps running; this path is not yet
+accepted (see `docs/ps3/native-console-processes.md` in the OpenPak docs repo).
+OpenPak does not use an emulator-only RPCN game bridge. Firmware and physical
+PS3 clients must use the same native PS3 endpoints, backed by account core.
+Plan: `docs/ps3/native-service-architecture.md` in the OpenPak docs repo.
 Build only through the shared OpenPak build lock.
 
 ## Licence
