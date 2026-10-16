@@ -891,8 +891,10 @@ VKGSRender::~VKGSRender()
 	m_frame_context_storage.clear();
 
 	// Textures
-	m_rtts.destroy();
+	// Framebuffer-backed cache sections unprotect their render targets while
+	// being destroyed. Release those references before freeing the targets.
 	m_texture_cache.destroy();
+	m_rtts.destroy();
 
 	m_overlay_recording_img.reset();
 	m_stencil_mirror_sampler.reset();
