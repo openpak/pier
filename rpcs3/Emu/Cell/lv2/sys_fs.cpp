@@ -3737,11 +3737,29 @@ error_code sys_fs_mapped_free(ppu_thread&, u32 fd, vm::ptr<void> ptr)
 	return CELL_OK;
 }
 
-error_code sys_fs_truncate2(ppu_thread&, u32 fd, u64 size)
+error_code sys_fs_truncate2(ppu_thread& ppu, u32 fd, u64 size)
 {
-	sys_fs.todo("sys_fs_truncate2(fd=%d, size=0x%x)", fd, size);
+	// VSH's media database (mms) sizes its journal with this right after opening it
+	// (vsh.self 0x51cb04 -> 0x6252b4) and flags the database broken (/dev_hdd0/mms/db.err,
+	// rebuilt on every boot) when the file does not change. Firmware 4.93 passes a guest
+	// address, not an fd, so the first argument is a path; an open fd is honoured too.
+	// ponytail: ABI inferred from that call site; the warning below records what arrives.
+	if (idm::check_unlocked<lv2_fs_object, lv2_file>(fd))
+	{
+		sys_fs.warning("sys_fs_truncate2(fd=%d, size=0x%llx)", fd, size);
+		return sys_fs_ftruncate(ppu, fd, size);
+	}
 
-	return CELL_OK;
+	const vm::cptr<char> path = vm::cast(fd);
+
+	if (!vm::check_addr(path.addr(), vm::page_readable, 1))
+	{
+		sys_fs.error("sys_fs_truncate2(arg=0x%x, size=0x%llx): neither an open fd nor a readable path", fd, size);
+		return CELL_EFAULT;
+	}
+
+	sys_fs.warning("sys_fs_truncate2(path=%s, size=0x%llx)", path, size);
+	return sys_fs_truncate(ppu, path, size);
 }
 
 error_code sys_fs_get_mount_info_size(ppu_thread&, vm::ptr<u64> len)
