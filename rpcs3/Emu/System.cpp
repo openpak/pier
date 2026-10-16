@@ -4334,6 +4334,17 @@ void Emulator::Kill(bool allow_autoexit, bool savestate, savestate_stage* save_s
 				g_emu_callbacks.enable_gamemode(false);
 			}
 
+#ifdef __linux__
+			// A game child is done once its guest has stopped: caches are written as they
+			// compile, so skip the multi-second host teardown and let VSH's wait return now.
+			if (std::getenv("PIER_NATIVE_GUEST_ARGV"))
+			{
+				sys_log.notice("Native game child: guest stopped, exiting host");
+				logs::listener::sync_all();
+				std::_Exit(0);
+			}
+#endif
+
 			if (allow_autoexit)
 			{
 				const bool autoexit = g_cfg.misc.autoexit.get();
