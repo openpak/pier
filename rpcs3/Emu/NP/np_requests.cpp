@@ -128,7 +128,15 @@ namespace np
 		if (!cb_info_opt)
 			return;
 
-		ensure(error == rpcn::ErrorType::NoError, "Unexpected error in GetWorldList reply");
+		if (error != rpcn::ErrorType::NoError)
+		{
+			rpcn_log.error("GetWorldList request failed: %s", error);
+			const s32 code = error == rpcn::ErrorType::Unauthorized
+				? SCE_NP_MATCHING2_SERVER_ERROR_FORBIDDEN
+				: SCE_NP_MATCHING2_SERVER_ERROR_INTERNAL_SERVER_ERROR;
+			cb_info_opt->queue_callback(req_id, 0, code, 0);
+			return;
+		}
 
 		std::vector<u32> world_list;
 		u32 num_worlds = reply.get<u32>();
@@ -704,6 +712,7 @@ namespace np
 
 		cb_info_opt->queue_callback(req_id, 0, error_code, 0);
 	}
+
 
 	u32 np_handler::set_userinfo(SceNpMatching2ContextId ctx_id, vm::cptr<SceNpMatching2RequestOptParam> optParam, const SceNpMatching2SetUserInfoRequest* req)
 	{

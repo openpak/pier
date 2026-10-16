@@ -563,6 +563,40 @@ error_code sys_ss_virtual_trm_manager(u64 pkg_id, u64 a1, u64 a2, u64 a3, u64 a4
 {
 	sys_ss.todo("sys_ss_virtual_trm_manager(pkg=0x%llx, a1=0x%llx, a2=0x%llx, a3=0x%llx, a4=0x%llx)", pkg_id, a1, a2, a3, a4);
 
+	if (pkg_id == 0x200e && a1 && a2)
+	{
+		// vsh's login service (FUN_0022eda8 builds the sign-in request, FUN_0022ea78 is its TLS certificate callback) hands the secure
+		// module a 16-byte key id (a1) and a 0x40-byte sealed blob in a2, and expects it decrypted in place: the first 8 bytes must
+		// be a fixed marker that depends on the key id, and the next 0x38 bytes are a secret it puts into the request.
+		// We cannot (and need not) reproduce Sony's secret: our own server accepts any value, so return the marker followed by
+		// a fixed filler. Without this the login service fails with 0x8002A280 (request) or 0x80710A06 (certificate callback).
+		static constexpr u8 key_request[16] = {0xed, 0xf4, 0xae, 0x21, 0xe7, 0x98, 0xb2, 0x63, 0x03, 0x24, 0x36, 0xd7, 0x57, 0xa7, 0x63, 0x83};
+		static constexpr u8 key_cert_cb[16] = {0xfd, 0xc8, 0x66, 0x9e, 0xd5, 0x6e, 0x00, 0xb1, 0x6f, 0x3c, 0x41, 0x92, 0x54, 0xf5, 0xa5, 0xae};
+
+		const u8* const key = vm::_ptr<const u8>(static_cast<u32>(a1));
+		const char* marker = nullptr;
+
+		if (std::memcmp(key, key_request, 16) == 0)
+		{
+			marker = "b7fe802b";
+		}
+		else if (std::memcmp(key, key_cert_cb, 16) == 0)
+		{
+			marker = "rucfeqvw";
+		}
+
+		if (marker)
+		{
+			u8* const out = vm::_ptr<u8>(static_cast<u32>(a2));
+			std::memcpy(out, marker, 8);
+
+			for (u32 i = 8; i < 0x40; i++)
+			{
+				out[i] = static_cast<u8>('A' + (i - 8) % 26);
+			}
+		}
+	}
+
 	return CELL_OK;
 }
 

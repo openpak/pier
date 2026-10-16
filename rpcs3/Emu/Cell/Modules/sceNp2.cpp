@@ -1,4 +1,5 @@
 #include "stdafx.h"
+#include "Emu/NP/server_list.h"
 #include "Emu/Cell/ErrorCodes.h"
 #include "Emu/Cell/PPUModule.h"
 #include "Emu/IdManager.h"
@@ -1278,14 +1279,13 @@ error_code sceNpMatching2GetServerIdListLocal(SceNpMatching2ContextId ctxId, vm:
 
 	const auto slist = nph.get_match2_server_list(ctxId);
 
-	u32 num_servs = std::min(static_cast<u32>(slist.size()), serverIdNum);
-
-	if (serverId)
+	if (serverId && serverIdNum)
 	{
-		for (u32 i = 0; i < num_servs; i++)
-		{
-			serverId[i] = slist[i];
-		}
+		if (serverIdNum > 0x7fff'ffffu ||
+			!vm::check_addr(serverId.addr(), vm::page_writable, serverIdNum * sizeof(SceNpMatching2ServerId)))
+			return SCE_NP_MATCHING2_ERROR_INVALID_ARGUMENT;
+
+		np::copy_server_ids(std::span{serverId.get_ptr(), serverIdNum}, slist);
 	}
 
 	return not_an_error(static_cast<s32>(slist.size()));
@@ -1433,7 +1433,7 @@ error_code sceNpMatching2ClearEventData(SceNpMatching2ContextId ctxId, SceNpMatc
 error_code sceNpMatching2GetUserInfoList(
     SceNpMatching2ContextId ctxId, vm::cptr<SceNpMatching2GetUserInfoListRequest> reqParam, vm::cptr<SceNpMatching2RequestOptParam> optParam, vm::ptr<SceNpMatching2RequestId> assignedReqId)
 {
-	sceNp2.todo("sceNpMatching2GetUserInfoList(ctxId=%d, reqParam=*0x%x, optParam=*0x%x, assignedReqId=*0x%x)", ctxId, reqParam, optParam, assignedReqId);
+	sceNp2.warning("sceNpMatching2GetUserInfoList(ctxId=%d, reqParam=*0x%x, optParam=*0x%x, assignedReqId=*0x%x)", ctxId, reqParam, optParam, assignedReqId);
 
 	auto& nph = g_fxo->get<named_thread<np::np_handler>>();
 	if (auto res = generic_match2_error_check(nph, ctxId, reqParam); res != CELL_OK)
@@ -1441,7 +1441,9 @@ error_code sceNpMatching2GetUserInfoList(
 		return res;
 	}
 
-	return CELL_OK;
+	// No native user lookup transport is implemented here. Do not claim a
+	// successful asynchronous request without scheduling its completion.
+	return SCE_NP_MATCHING2_SERVER_ERROR_SERVICE_UNAVAILABLE;
 }
 
 error_code sceNpMatching2GetRoomMemberDataInternal(

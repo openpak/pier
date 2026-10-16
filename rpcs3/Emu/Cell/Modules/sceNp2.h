@@ -635,9 +635,13 @@ struct SceNpMatching2UserInfo
 	SceNpUserInfo2 userInfo;
 	vm::bptr<SceNpMatching2BinAttr> userBinAttr;
 	be_t<u32> userBinAttrNum;
-	SceNpMatching2JoinedSessionInfo joinedSessionInfo;
+	vm::bptr<SceNpMatching2JoinedSessionInfo> joinedSessionInfo;
 	be_t<u32> joinedSessionInfoNum;
 };
+
+static_assert(offsetof(SceNpMatching2UserInfo, joinedSessionInfo) == 56);
+static_assert(offsetof(SceNpMatching2UserInfo, joinedSessionInfoNum) == 60);
+static_assert(sizeof(SceNpMatching2UserInfo) == 64);
 
 // Server
 struct SceNpMatching2Server

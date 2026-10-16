@@ -344,7 +344,11 @@ struct cfg_root : cfg::node
 		cfg::_enum<np_internet_status> net_active{this, "Internet enabled", np_internet_status::enabled}; // Pier: always connected
 		cfg::string ip_address{this, "IP address", "0.0.0.0"};
 		cfg::string bind_address{this, "Bind address", "0.0.0.0"};
-		cfg::string dns{this, "DNS address", "8.8.8.8"};
+		// Pier: the emulated network hands the firmware OpenPak's DNS, as a router
+		// would; it answers Sony names with OpenPak's servers, exactly what a real
+		// PS3 set to the same DNS gets. Pier rewrites no names itself.
+		// ponytail: literal address of the primary server; change it if that box moves.
+		cfg::string dns{this, "DNS address", "145.241.199.19"};
 		cfg::string swap_list{this, "IP swap list", ""};
 		cfg::_bool upnp_enabled{this, "UPNP Enabled", false};
 		cfg::_bool derive_mac_from_psid{this, "Derive MAC from PSID", false};
