@@ -2533,6 +2533,20 @@ const std::string& fs::get_config_dir([[maybe_unused]] bool get_config_subdirect
 		}
 
 #ifdef _WIN32
+		// Pier: per-user settings in %APPDATA%\Pier (RPCS3_CONFIG_DIR and a
+		// portable/ folder next to the executable still take precedence).
+		if (const char* appdata = ::getenv("APPDATA"); appdata && *appdata && !::getenv("RPCS3_CONFIG_DIR"))
+		{
+			dir = appdata;
+			std::replace(dir.begin(), dir.end(), '\\', '/');
+			dir += "/Pier/";
+			if (!create_path(dir))
+			{
+				std::printf("Failed to create configuration directory '%s' (%d).\n", dir.c_str(), errno);
+			}
+			return dir;
+		}
+
 		std::vector<wchar_t> buf;
 
 		// Check if RPCS3_CONFIG_DIR is set and get the required buffer size
@@ -2590,7 +2604,12 @@ const std::string& fs::get_config_dir([[maybe_unused]] bool get_config_subdirect
 		else // Just in case
 			dir = "./config";
 
-		dir += "/rpcs3/";
+		// Pier's own per-user folder: ~/.config/pier, ~/Library/Application Support/Pier.
+#ifdef __APPLE__
+		dir += "/Pier/";
+#else
+		dir += "/pier/";
+#endif
 
 		if (!create_path(dir))
 		{
@@ -2623,7 +2642,21 @@ const std::string& fs::get_cache_dir()
 		std::string dir;
 
 #ifdef _WIN32
-		dir = get_config_dir();
+		// Pier: caches are local, not roaming: %LOCALAPPDATA%\Pier.
+		if (const char* local = ::getenv("LOCALAPPDATA"); local && *local && !::getenv("RPCS3_CONFIG_DIR") && !is_dir(get_executable_dir() + "/portable/"))
+		{
+			dir = local;
+			std::replace(dir.begin(), dir.end(), '\\', '/');
+			dir += "/Pier/";
+			if (!create_path(dir))
+			{
+				std::printf("Failed to create cache directory '%s' (%d).\n", dir.c_str(), errno);
+			}
+		}
+		else
+		{
+			dir = get_config_dir();
+		}
 #else
 
 #ifdef __APPLE__
@@ -2640,7 +2673,12 @@ const std::string& fs::get_cache_dir()
 		else // Just in case
 			dir = "./cache";
 
-		dir += "/rpcs3/";
+		// ~/.cache/pier, ~/Library/Caches/Pier.
+#ifdef __APPLE__
+		dir += "/Pier/";
+#else
+		dir += "/pier/";
+#endif
 
 		if (!create_path(dir))
 		{
