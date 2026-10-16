@@ -120,6 +120,27 @@ gs_frame::gs_frame(QScreen* screen, const QRect& geometry, const QIcon& appIcon,
 	setGeometry(geometry);
 	setTitle(QString::fromStdString(m_window_title));
 
+#ifdef HAVE_X11
+	// Pier: like a PS3 swapping the XMB for the game, a native game child draws inside the
+	// firmware's window. X11 only: Wayland has no cross-process embedding, so run-pier.sh uses xcb.
+	if (QGuiApplication::platformName() == "xcb" && qEnvironmentVariableIsSet("PIER_NATIVE_GUEST_ARGV"))
+	{
+		if (const WId host = qEnvironmentVariable("PIER_VSH_WINDOW").toULongLong())
+		{
+			XWindowAttributes attributes{};
+			if (Display* display = XOpenDisplay(nullptr))
+			{
+				XGetWindowAttributes(display, host, &attributes);
+				XCloseDisplay(display);
+			}
+			m_embedded = true;
+			m_start_games_fullscreen = false;
+			setParent(QWindow::fromWinId(host));
+			setGeometry(0, 0, std::max(attributes.width, 160), std::max(attributes.height, 90));
+		}
+	}
+#endif
+
 	if (g_cfg.video.renderer != video_renderer::opengl)
 	{
 		// Do not display the window before OpenGL is configured!
@@ -129,6 +150,14 @@ gs_frame::gs_frame(QScreen* screen, const QRect& geometry, const QIcon& appIcon,
 	}
 
 	load_gui_settings();
+
+#ifdef HAVE_X11
+	if (!m_embedded && QGuiApplication::platformName() == "xcb" && !qEnvironmentVariableIsSet("PIER_NATIVE_GUEST_ARGV"))
+	{
+		// Game children inherit this and embed themselves into the firmware's window.
+		qputenv("PIER_VSH_WINDOW", QByteArray::number(static_cast<qulonglong>(winId())));
+	}
+#endif
 
 	// Change cursor when in fullscreen.
 	connect(this, &QWindow::visibilityChanged, this, [this](Visibility visibility)
@@ -218,6 +247,12 @@ void gs_frame::paintEvent(QPaintEvent* event)
 
 void gs_frame::showEvent(QShowEvent* event)
 {
+	if (m_embedded)
+	{
+		QWindow::showEvent(event);
+		return;
+	}
+
 	// We have to calculate new window positions, since the frame is only known once the window was created.
 	// We will try to find the originally requested dimensions if possible by moving the frame.
 
@@ -439,6 +474,11 @@ void gs_frame::handle_shortcut(gui::shortcuts::shortcut shortcut_key, const QKey
 
 void gs_frame::toggle_fullscreen()
 {
+	if (m_embedded)
+	{
+		return; // The firmware's window owns fullscreen.
+	}
+
 	Emu.CallFromMainThread([this]()
 	{
 		if (visibility() == FullScreen)
@@ -652,8 +692,11 @@ void gs_frame::hide_on_close()
 {
 	// Make sure not to save the hidden state, which is useless to us.
 	const Visibility current_visibility = visibility();
-	m_gui_settings->SetValue(gui::gs_visibility, gui::visibility_to_string(current_visibility == Visibility::Hidden ? m_visibility : current_visibility), false);
-	m_gui_settings->SetValue(gui::gs_geometry, geometry(), true);
+	if (!m_embedded)
+	{
+		m_gui_settings->SetValue(gui::gs_visibility, gui::visibility_to_string(current_visibility == Visibility::Hidden ? m_visibility : current_visibility), false);
+		m_gui_settings->SetValue(gui::gs_geometry, geometry(), true);
+	}
 
 	if (!g_progr_text)
 	{
@@ -719,7 +762,11 @@ void gs_frame::show()
 	{
 		QWindow::show();
 
-		if (g_cfg.misc.start_fullscreen || m_start_games_fullscreen)
+		if (m_embedded)
+		{
+			requestActivate();
+		}
+		else if (g_cfg.misc.start_fullscreen || m_start_games_fullscreen)
 		{
 			setVisibility(FullScreen);
 		}
@@ -1252,6 +1299,24 @@ bool gs_frame::event(QEvent* ev)
 			return true;
 		}
 	}
+#ifdef HAVE_X11
+	else if (ev->type() == QEvent::Resize && !m_embedded && QGuiApplication::platformName() == "xcb")
+	{
+		// Keep an embedded game child the size of the firmware's window.
+		if (Display* display = XOpenDisplay(nullptr))
+		{
+			::Window x_root{}, x_parent{}, *x_children = nullptr;
+			unsigned count = 0;
+			if (XQueryTree(display, winId(), &x_root, &x_parent, &x_children, &count))
+			{
+				for (unsigned i = 0; i < count; i++)
+					XMoveResizeWindow(display, x_children[i], 0, 0, client_width(), client_height());
+				XFree(x_children);
+			}
+			XCloseDisplay(display);
+		}
+	}
+#endif
 	else if (ev->type() == QEvent::MouseMove && (!m_show_mouse || m_mousehide_timer.isActive()))
 	{
 		// This will make the cursor visible again if it was hidden by the mouse idle timeout

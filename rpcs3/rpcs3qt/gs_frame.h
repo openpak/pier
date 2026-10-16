@@ -48,6 +48,7 @@ private:
 	bool m_flip_showed_frame = false;
 	bool m_start_games_fullscreen = false;
 	bool m_ignore_stop_events = false;
+	bool m_embedded = false; // Pier: a game child drawn inside the firmware's window
 
 	std::shared_ptr<utils::video_encoder> m_video_encoder{};
 
