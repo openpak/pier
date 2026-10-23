@@ -150,7 +150,7 @@ The bridge entries above are historical; architecture-correction-audit.md in
 OpenPak docs records their removal. Native firmware/game IPC is required.
 An isolated, disconnected VSH gametool-mode probe created the real keyed
 packet memory/mutexes/conditions and started Matching2 workers. Details and
-acceptance boundaries: docs/ps3/native-ipc-lifecycle.md in OpenPak docs.
+acceptance boundaries: internal research notes.
 No firmware implementation or decompiled source is incorporated here.
 
 Fixed the executable-after-`--` CLI path: resolve the already selected spath,
