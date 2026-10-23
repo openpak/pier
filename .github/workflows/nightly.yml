@@ -1,0 +1,381 @@
+name: Nightly
+
+# A nightly pre-release of Pier, built only when the source changed.
+#
+# - Once a day (02:30 UTC) and by hand. Builds the default branch (master).
+# - The check job compares the commit the rolling `nightly` tag points at with the branch head:
+#   no change, or a change to documentation only (*.md, docs/, LICENSE, issue templates), means no
+#   build and no release change. A scheduled run of a private repository is skipped too (hosted
+#   runners cost organisation minutes there); a manual run still builds.
+# - One rolling pre-release, tag `nightly`. Only the prepare job creates or edits it (removing the
+#   previous build's files first); the build jobs attach to it; the publish job moves the tag to the
+#   built commit and writes the notes once every build succeeded. A failed run leaves the tag where
+#   it was, so the next night tries again. Never marked latest: /releases/latest stays on the last
+#   vX.Y.Z release.
+# - The tag moves through the API with GITHUB_TOKEN, which starts no other workflow.
+on:
+  schedule:
+    - cron: '30 2 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Only run the change check (no build, no release change)'
+        type: boolean
+        default: false
+      force:
+        description: 'Build even if nothing changed'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nightly
+  cancel-in-progress: false
+
+env:
+  PRODUCT: Pier
+
+jobs:
+  check:
+    name: Check for source changes
+    runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.check.outputs.build }}
+      sha: ${{ steps.check.outputs.sha }}
+      short: ${{ steps.check.outputs.short }}
+      date: ${{ steps.check.outputs.date }}
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - name: Compare the branch head with the last nightly
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          PRIVATE: ${{ github.event.repository.private }}
+          EVENT: ${{ github.event_name }}
+          DRY_RUN: ${{ inputs.dry_run || false }}
+          FORCE: ${{ inputs.force || false }}
+        run: |
+          set -euo pipefail
+          repo="$GITHUB_REPOSITORY"
+          if [ "$GITHUB_REF" != "refs/heads/$DEFAULT_BRANCH" ]; then
+            echo "::error::Nightlies build $DEFAULT_BRANCH; start this workflow from that branch."
+            exit 1
+          fi
+          head="$GITHUB_SHA"
+          short="${head:0:7}"
+          {
+            echo "sha=$head"
+            echo "short=$short"
+            echo "date=$(date -u +%Y-%m-%d)"
+            echo "version=nightly-$(date -u +%Y%m%d)-$short"
+          } >> "$GITHUB_OUTPUT"
+
+          decide() {
+            local build="$1" reason="$2"
+            if [ "$build" = true ] && [ "$DRY_RUN" = true ]; then
+              build=false
+              reason="Dry run, no build. A real run would build: $reason"
+            fi
+            echo "build=$build" >> "$GITHUB_OUTPUT"
+            echo "$reason" | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          }
+
+          if [ "$PRIVATE" = true ] && [ "$EVENT" = schedule ]; then
+            decide false "The repository is private: scheduled nightlies wait until it is public (start one by hand to build anyway)."
+          fi
+          if [ "$FORCE" = true ]; then
+            decide true "Forced build of $short."
+          fi
+          if ! prev=$(gh api "repos/$repo/git/ref/tags/nightly" --jq .object.sha 2>/dev/null) || [ -z "$prev" ]; then
+            decide true "No nightly yet: building $short."
+          fi
+          if ! body=$(gh release view nightly --repo "$repo" --json body --jq .body 2>/dev/null); then
+            body=""
+          fi
+          if ! grep -qF "nightly-complete: $prev" <<<"$body"; then
+            decide true "The nightly at ${prev:0:7} did not finish: building $short."
+          fi
+          if [ "$prev" = "$head" ]; then
+            decide false "Nothing changed since the last nightly (${prev:0:7}): no build."
+          fi
+          if ! cmp=$(gh api "repos/$repo/compare/$prev...$head" 2>/dev/null); then
+            decide true "The last nightly's commit ${prev:0:7} is no longer in the history: building $short."
+          fi
+          if [ "$(jq -r .status <<<"$cmp")" != ahead ]; then
+            decide true "$DEFAULT_BRANCH is not ahead of the last nightly (${prev:0:7}; history rewritten): building $short."
+          fi
+          files=$(jq -r '.files[] | .filename, (.previous_filename // empty)' <<<"$cmp")
+          if [ "$(jq '.files | length' <<<"$cmp")" -ge 300 ]; then
+            decide true "300 or more files changed since ${prev:0:7}: building $short."
+          fi
+          code=$(grep -Ev '(^|/)[^/]*\.md$|^docs/|^LICENSE[^/]*$|^\.github/ISSUE_TEMPLATE/' <<<"$files" || true)
+          if [ -z "$code" ]; then
+            decide false "Only documentation changed since ${prev:0:7}: no build."
+          fi
+          decide true "$(grep -c . <<<"$code") changed source files since ${prev:0:7}: building $short."
+
+  prepare:
+    name: Prepare the nightly release
+    needs: [check]
+    if: needs.check.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create the release or clear the previous build's files
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SHA: ${{ needs.check.outputs.sha }}
+          TITLE: ${{ env.PRODUCT }} nightly ${{ needs.check.outputs.date }} (${{ needs.check.outputs.short }})
+        run: |
+          set -euo pipefail
+          notes="Building $SHA. These notes are replaced once every build has finished."
+          if gh release view nightly >/dev/null 2>&1; then
+            gh release view nightly --json assets --jq '.assets[].name' | while IFS= read -r asset; do
+              if [ -n "$asset" ]; then gh release delete-asset nightly "$asset" --yes; fi
+            done
+            gh release edit nightly --prerelease --latest=false --title "$TITLE (building)" --notes "$notes"
+          else
+            gh release create nightly --target "$SHA" --prerelease --latest=false \
+              --title "$TITLE (building)" --notes "$notes"
+          fi
+
+  # Linux x86_64 (clang, upstream's CI container) and Windows x64 (MSVC), the way upstream's
+  # rpcs3.yml builds them. Upstream's own jobs publish only from RPCS3/rpcs3, so they never run
+  # here on a push.
+  pins:
+    name: Read the build pins from rpcs3.yml
+    needs: [check]
+    if: needs.check.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      linux_image: ${{ steps.pins.outputs.linux_image }}
+      windows_env: ${{ steps.pins.outputs.windows_env }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.check.outputs.sha }}
+          sparse-checkout: .github/workflows
+      # The container image and the Windows toolchain versions follow upstream's file, so a merge
+      # from upstream moves the nightly with it.
+      - name: Read the pins
+        id: pins
+        run: |
+          set -euo pipefail
+          f=.github/workflows/rpcs3.yml
+          image=$(yq '.jobs.Linux_Build.strategy.matrix.include[] | select(.os == "ubuntu-24.04" and .compiler == "clang") | .docker_img' "$f")
+          winenv=$(yq -o=json -I=0 '.jobs.Windows_Build.env' "$f")
+          if [ -z "$image" ] || [ "$image" = null ] || [ "$winenv" = null ] || grep -q '[$][{][{]' <<<"$winenv"; then
+            echo "::error::rpcs3.yml no longer has the Linux image or a plain Windows_Build env."
+            exit 1
+          fi
+          echo "linux_image=$image" >> "$GITHUB_OUTPUT"
+          echo "windows_env=$winenv" >> "$GITHUB_OUTPUT"
+          echo "Linux image $image" >> "$GITHUB_STEP_SUMMARY"
+
+  linux:
+    name: Linux x86_64 (clang)
+    needs: [check, prepare, pins]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    env:
+      BUILD_REPOSITORY_NAME: ${{ github.repository }}
+      BUILD_SOURCEBRANCHNAME: ${{ github.ref_name }}
+      BUILD_SOURCEVERSION: ${{ needs.check.outputs.sha }}
+      BUILD_ARTIFACTSTAGINGDIRECTORY: ${{ github.workspace }}/artifacts/
+      CCACHE_DIR: ${{ github.workspace }}/ccache
+      DEPLOY_APPIMAGE: true
+      APPDIR: /rpcs3/build/appdir
+      ARTDIR: /root/artifacts
+      RELEASE_MESSAGE: /rpcs3/GitHubReleaseMessage.txt
+      COMPILER: clang
+      RUN_UNIT_TESTS: 'OFF'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.check.outputs.sha }}
+          fetch-depth: 0
+      - name: Restore the ccache
+        id: ccache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ${{ runner.os }}-ccache-clang-${{ runner.arch }}-${{ github.run_id }}
+          restore-keys: ${{ runner.os }}-ccache-clang-${{ runner.arch }}-
+      - name: Build in upstream's CI container
+        env:
+          IMAGE: ${{ needs.pins.outputs.linux_image }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$CCACHE_DIR" "$BUILD_ARTIFACTSTAGINGDIRECTORY"
+          docker pull --quiet "$IMAGE"
+          docker run -v "$PWD:/rpcs3" --env-file .ci/docker.env -v "$CCACHE_DIR:/root/.ccache" \
+            -v "$BUILD_ARTIFACTSTAGINGDIRECTORY:$ARTDIR" "$IMAGE" /rpcs3/.ci/build-linux.sh
+      - name: Save the ccache
+        if: always() && steps.ccache.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ${{ steps.ccache.outputs.cache-primary-key }}
+      - name: Attach to the nightly release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=("$BUILD_ARTIFACTSTAGINGDIRECTORY"/*.AppImage)
+          if [ ${#files[@]} -ne 1 ]; then
+            echo "::error::Expected one AppImage, found ${#files[@]}."
+            exit 1
+          fi
+          cp "${files[0]}" pier-nightly-linux-x86_64.AppImage
+          gh release upload nightly pier-nightly-linux-x86_64.AppImage --clobber
+
+  windows:
+    name: Windows x64 (MSVC)
+    needs: [check, prepare, pins]
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 300
+    defaults:
+      run:
+        shell: bash
+    env:
+      BUILD_REPOSITORY_NAME: ${{ github.repository }}
+      BUILD_SOURCEBRANCHNAME: ${{ github.ref_name }}
+      BUILD_SOURCEVERSION: ${{ needs.check.outputs.sha }}
+      BUILD_ARTIFACTSTAGINGDIRECTORY: ${{ github.workspace }}/artifacts/
+    steps:
+      - name: Load the Windows pins from rpcs3.yml
+        env:
+          PINS: ${{ needs.pins.outputs.windows_env }}
+        run: jq -r 'to_entries[] | "\(.key)=\(.value)"' <<<"$PINS" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.check.outputs.sha }}
+          fetch-depth: 0
+      - uses: nuget/setup-nuget@v2
+      - name: Restore NuGet packages
+        run: nuget restore rpcs3.sln
+      - name: Setup env
+        shell: pwsh
+        run: |
+          echo "QTDIR=C:\Qt\${{ env.QT_VER }}\${{ env.QT_VER_MSVC }}_64" >> ${{ github.env }}
+          echo "VULKAN_SDK=C:\VulkanSDK\${{ env.VULKAN_VER }}" >> ${{ github.env }}
+      - name: Get cache keys
+        run: .ci/get_keys-windows.sh
+      - name: Restore the ccache
+        id: ccache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ${{ runner.os }}-ccache-${{ env.COMPILER }}-${{ github.run_id }}
+          restore-keys: ${{ runner.os }}-ccache-${{ env.COMPILER }}-
+      - name: Restore the dependencies
+        id: deps
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.DEPS_CACHE_DIR }}
+          key: ${{ runner.os }}-${{ env.COMPILER }}-${{ env.QT_VER }}-${{ env.VULKAN_SDK_SHA }}-${{ env.CCACHE_SHA }}-${{ hashFiles('llvm.lock') }}
+          restore-keys: ${{ runner.os }}-${{ env.COMPILER }}-
+      - name: Download and unpack dependencies
+        run: |
+          .ci/setup-windows.sh
+          .ci/setup-windows-ci-vars.sh win64 msvc
+      - name: Export variables
+        run: |
+          while IFS='=' read -r key val; do
+            [[ -z "$key" || "$key" =~ ^# ]] && continue
+            echo "$key=$val" >> "$GITHUB_ENV"
+          done < .ci/ci-vars.env
+      - uses: microsoft/setup-msbuild@v2
+      - name: Compile
+        shell: pwsh
+        run: msbuild rpcs3.sln /p:Configuration=Release /v:minimal /p:Platform=x64 /p:PreferredToolArchitecture=x64 /p:CLToolPath=${{ env.CCACHE_BIN_DIR }} /p:UseMultiToolTask=true /p:CustomAfterMicrosoftCommonTargets="${{ github.workspace }}\buildfiles\msvc\ci_only.targets"
+      - name: Pack
+        run: |
+          mkdir -p "$BUILD_ARTIFACTSTAGINGDIRECTORY"
+          .ci/deploy-windows.sh
+      - name: Save the ccache
+        if: always() && steps.ccache.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ${{ steps.ccache.outputs.cache-primary-key }}
+      - name: Save the dependencies
+        if: always() && steps.deps.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.DEPS_CACHE_DIR }}
+          key: ${{ steps.deps.outputs.cache-primary-key }}
+      - name: Attach to the nightly release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(artifacts/*.7z)
+          if [ ${#files[@]} -ne 1 ]; then
+            echo "::error::Expected one 7z, found ${#files[@]}."
+            exit 1
+          fi
+          cp "${files[0]}" pier-nightly-windows-x64.7z
+          gh release upload nightly pier-nightly-windows-x64.7z --clobber
+
+  publish:
+    name: Publish the nightly
+    needs: [check, linux, windows]
+    if: needs.check.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Move the nightly tag and write the notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SHA: ${{ needs.check.outputs.sha }}
+          BRANCH: ${{ github.event.repository.default_branch }}
+          TITLE: ${{ env.PRODUCT }} nightly ${{ needs.check.outputs.date }} (${{ needs.check.outputs.short }})
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          set -euo pipefail
+          # gh api prints the error body on stdout when it fails, so only a success counts.
+          if ! prev=$(gh api "repos/$GH_REPO/git/ref/tags/nightly" --jq .object.sha 2>/dev/null); then
+            prev=""
+          fi
+          if [ -n "$prev" ] && [ "$prev" != "$SHA" ] && cmp=$(gh api "repos/$GH_REPO/compare/$prev...$SHA" 2>/dev/null) \
+            && [ "$(jq -r .status <<<"$cmp")" = ahead ]; then
+            range="${prev:0:7}..${SHA:0:7}"
+            total=$(jq -r .total_commits <<<"$cmp")
+            log=$(jq -r '.commits | reverse | .[] | "\(.sha[0:7]) \(.commit.message | split("\n")[0])"' <<<"$cmp")
+          else
+            range="${SHA:0:7}"
+            total=1
+            log=$(gh api "repos/$GH_REPO/commits/$SHA" --jq '"\(.sha[0:7]) \(.commit.message | split("\n")[0])"')
+          fi
+          {
+            echo "Automatic build of \`$BRANCH\` at $SHA (version \`$VERSION\`)."
+            echo "A development build, not a release: for the current release see the latest vX.Y.Z release."
+            echo
+            echo "### Changes since the previous nightly ($range, $total commits)"
+            echo
+            echo '```'
+            head -n 30 <<<"$log"
+            echo '```'
+            if [ "$total" -gt 30 ]; then
+              echo
+              echo "And $((total - 30)) more: https://github.com/$GH_REPO/compare/$range"
+            fi
+            echo
+            echo "<!-- nightly-complete: $SHA -->"
+          } > notes.md
+          if [ -n "$prev" ]; then
+            gh api -X PATCH "repos/$GH_REPO/git/refs/tags/nightly" -f sha="$SHA" -F force=true >/dev/null
+          else
+            gh api "repos/$GH_REPO/git/refs" -f ref=refs/tags/nightly -f sha="$SHA" >/dev/null
+          fi
+          gh release edit nightly --prerelease --latest=false --title "$TITLE" --notes-file notes.md
+          cat notes.md >> "$GITHUB_STEP_SUMMARY"
