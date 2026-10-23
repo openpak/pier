@@ -357,7 +357,7 @@ jobs:
             log=$(gh api "repos/$GH_REPO/commits/$SHA" --jq '"\(.sha[0:7]) \(.commit.message | split("\n")[0])"')
           fi
           {
-            echo "Automatic build of \`$BRANCH\` at $SHA (version \`$VERSION\`)."
+            echo "Automatic build of \`$BRANCH\` at $SHA (nightly \`$VERSION\`)."
             echo "A development build, not a release: for the current release see the latest vX.Y.Z release."
             echo
             echo "### Changes since the previous nightly ($range, $total commits)"
