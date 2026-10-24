@@ -2032,7 +2032,7 @@ error_code sys_net_infoctl(ppu_thread& ppu, s32 cmd, vm::ptr<void> arg)
 
 // ---------------------------------------------------------------------------
 // Pier: emulated wired port (eth0) for the VSH network manager (ntm).
-// See scratch/pier/analysis/netlink.md for the disassembly this is based on.
+// Behaviour observed from the firmware's calls; no firmware code is included.
 // ---------------------------------------------------------------------------
 namespace
 {
@@ -2245,7 +2245,7 @@ static error_code net_infoctl_link_events(s32 cmd, vm::ptr<void> arg)
 	g_net_eth0_evq = static_cast<u32>(*reinterpret_cast<const be_t<u64>*>(blk));
 
 	// A real PHY reports "link up" a moment after the interface goes up. Report it right away: one event per
-	// registration, the connect step of the firmware is blocked on it (see ipobtain.md)
+	// registration, the connect step of the firmware is blocked on it
 	net_post_link_event();
 	return CELL_OK;
 }
