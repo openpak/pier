@@ -47,10 +47,9 @@ struct native_console_context
 		const char* value = std::getenv("PIER_NATIVE_CONSOLE_FD");
 		if (!value || !*value)
 		{
-			// The normal boot: firmware owns a console of its own and games it
-			// launches join it as child hosts. PIER_NATIVE_CONSOLE=0 opts out.
-			const char* mode = std::getenv("PIER_NATIVE_CONSOLE");
-			if ((mode && std::string_view{mode} == "0") || !pier_boots_firmware()) return;
+			// Every firmware boot owns a console of its own, and games it launches
+			// join it as child hosts: on Linux this is the only XMB launch path.
+			if (!pier_boots_firmware()) return;
 			memory.emplace(native_console_memory::create(&fail));
 		}
 		else

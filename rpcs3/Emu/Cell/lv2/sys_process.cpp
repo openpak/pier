@@ -692,30 +692,31 @@ error_code sys_process_spawns_a_self2(ppu_thread& ppu, vm::ptr<u32> pid, u32 pri
 	sys_process.todo("sys_process_spawns_a_self2(pid=*0x%x, primary_prio=0x%x, flags=0x%llx, stack=*0x%x, stack_size=0x%x, mem_id=0x%x, param_sfo=*0x%x, dbg_data=*0x%x"
 		, pid, primary_prio, flags, stack, stack_size, mem_id, param_sfo, dbg_data);
 
-	// The XMB's installed-game launch. With the shared native console (Linux
-	// default) the game becomes a real child host and its PID is returned; the
-	// VSH-replacing single-process handoff below is offline diagnostics only.
+	// The XMB's installed-game launch. On Linux the game always runs as a child
+	// host of the shared native console while VSH keeps running, and its PID is
+	// returned. Other platforms have no native console yet: there the only path
+	// replaces VSH with the game, which destroys the firmware services the game
+	// needs, so it stays behind PIER_ALLOW_OFFLINE_HANDOFF=1 (offline diagnostics).
 	// Other VSH helpers (e.g. background media workers) still follow the upstream
 	// path below; they must not replace the firmware process.
-#ifdef __linux__
-	auto& context = g_fxo->get<pier::native_console_context>();
-#endif
 	if (g_ps3_process_info.get_cellos_appname() == "vsh.self" && primary_prio == 1001)
 	{
-		// Replacing VSH destroys the native services required by the game.
-		// Keep this old offline launch path out of normal firmware operation.
-		const char* offline_handoff = std::getenv("PIER_ALLOW_OFFLINE_HANDOFF");
-		const bool native =
 #ifdef __linux__
-			context.kernel != nullptr;
+		static_cast<void>(ppu);
+		auto& context = g_fxo->get<pier::native_console_context>();
+		if (!context.kernel)
+		{
+			sys_process.error("Native game launch requires the shared native console, which this boot did not start");
+			return CELL_ENOSYS;
+		}
 #else
-			false;
-#endif
-		if (!native && (!offline_handoff || std::string_view{offline_handoff} != "1"))
+		const char* offline_handoff = std::getenv("PIER_ALLOW_OFFLINE_HANDOFF");
+		if (!offline_handoff || std::string_view{offline_handoff} != "1")
 		{
 			sys_process.error("Native game launch requires preserved firmware services; offline replacement is disabled");
 			return CELL_ENOSYS;
 		}
+#endif
 		if (!pid || !vm::check_addr(pid.addr(), vm::page_writable, sizeof(u32)) ||
 			stack_size < 24 || stack_size > 0x10000 ||
 			!vm::check_addr(stack.addr(), vm::page_readable, stack_size))
@@ -737,15 +738,12 @@ error_code sys_process_spawns_a_self2(ppu_thread& ppu, vm::ptr<u32> pid, u32 pri
 		}
 
 #ifdef __linux__
-		if (native)
-		{
-			u32 child = 0;
-			const error_code result = native_game_spawn(context, std::move(argv), envp, child);
-			if (result == CELL_OK)
-				*pid = child;
-			return result;
-		}
-#endif
+		u32 child = 0;
+		const error_code result = native_game_spawn(context, std::move(argv), envp, child);
+		if (result == CELL_OK)
+			*pid = child;
+		return result;
+#else
 		const std::string path = vfs::get(argv.front());
 		if (path.empty() || !fs::is_file(path))
 			return CELL_ENOENT;
@@ -780,6 +778,7 @@ error_code sys_process_spawns_a_self2(ppu_thread& ppu, vm::ptr<u32> pid, u32 pri
 				break;
 			ppu.state.wait(state);
 		}
+#endif
 	}
 
 	return CELL_OK;

@@ -61,11 +61,11 @@ and Windows; a `portable/` folder next to the binary takes precedence).
 ## Known limitations
 
 - Game networking is incomplete. Firmware services and IPC must survive a game
-  launch, and that path is not yet accepted. The old single-process replacement
-  launch is disabled by default; `PIER_ALLOW_OFFLINE_HANDOFF=1` enables it for
-  offline diagnostics only. With the shared native console (the default on
-  Linux, `PIER_NATIVE_CONSOLE=0` opts out), a game launched from the XMB runs as
-  a separate Pier process while the XMB keeps running.
+  launch, and that path is not yet accepted. On Linux a game launched from the
+  XMB always runs as a separate Pier process on a shared native console while
+  the XMB keeps running. Other platforms have no native console yet: there the
+  only launch replaces the XMB with the game, is disabled by default, and
+  `PIER_ALLOW_OFFLINE_HANDOFF=1` enables it for offline diagnostics only.
 - OpenPak does not use an emulator-only game bridge: Pier and a real PS3 are
   meant to use the same native PS3 endpoints.
 - The trophy backend exists, but a trophy sync has not been seen end to end.
