@@ -1930,9 +1930,6 @@ static void net_write_sockinfo(s32 s, lv2_socket& sock, sys_net_sockinfo_t& info
 // Pier: link events of the wired port, defined with the other eth0 emulation below
 static error_code net_infoctl_link_events(s32 cmd, vm::ptr<void> arg);
 
-// Pier: id of the event queue the firmware's ntm thread registered with sys_net_infoctl(55) (0 = none). sys_event.cpp logs traffic on it.
-atomic_t<u32> g_pier_ntm_queue{0};
-
 error_code sys_net_infoctl(ppu_thread& ppu, s32 cmd, vm::ptr<void> arg)
 {
 	ppu.state += cpu_flag::wait;
@@ -2246,7 +2243,6 @@ static error_code net_infoctl_link_events(s32 cmd, vm::ptr<void> arg)
 
 	g_net_eth0_evdata = *reinterpret_cast<const be_t<u64>*>(blk + 8);
 	g_net_eth0_evq = static_cast<u32>(*reinterpret_cast<const be_t<u64>*>(blk));
-	g_pier_ntm_queue = g_net_eth0_evq.load();
 
 	// A real PHY reports "link up" a moment after the interface goes up. Report it right away: one event per
 	// registration, the connect step of the firmware is blocked on it (see ipobtain.md)

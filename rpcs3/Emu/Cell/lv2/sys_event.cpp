@@ -32,10 +32,6 @@ static bool native_port_connected(const lv2_event_port& port)
 static bool native_port_connected(const lv2_event_port&) { return false; }
 #endif
 
-// Pier: ntm event queue of the firmware (see sys_net.cpp), traffic on it is logged
-extern atomic_t<u32> g_pier_ntm_queue;
-
-
 lv2_event_queue::lv2_event_queue(u32 protocol, s32 type, s32 size, u64 name, u64 ipc_key) noexcept
 	: id(idm::last_id<lv2_event_queue>())
 	, protocol{static_cast<u8>(protocol)}
@@ -551,11 +547,6 @@ error_code sys_event_queue_receive(ppu_thread& ppu, u32 equeue_id, vm::ptr<sys_e
 
 	sys_event.trace("sys_event_queue_receive(equeue_id=0x%x, *0x%x, timeout=0x%llx)", equeue_id, dummy_event, timeout);
 
-	if (equeue_id == g_pier_ntm_queue)
-	{
-		sys_event.notice("ntm queue 0x%x: receive (timeout=0x%llx)", equeue_id, timeout);
-	}
-
 #ifdef __linux__
 	if (auto native = get_native_event(equeue_id))
 	{
@@ -937,11 +928,6 @@ error_code sys_event_port_send(u32 eport_id, u64 data1, u64 data2, u64 data3)
 		if (lv2_obj::check(port.queue))
 		{
 			const u64 source = port.name ? port.name : (u64{process_getpid() + 0u} << 32) | u64{eport_id};
-
-			if (port.queue->id == g_pier_ntm_queue)
-			{
-				sys_event.notice("ntm queue 0x%x: port 0x%x send data1=0x%llx data2=0x%llx data3=0x%llx", port.queue->id, eport_id, data1, data2, data3);
-			}
 
 			return port.queue->send(source, data1, data2, data3, &notified_thread, ppu && port.queue->type == SYS_PPU_QUEUE ? &port : nullptr);
 		}
