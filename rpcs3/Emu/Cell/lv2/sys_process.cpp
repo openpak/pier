@@ -692,8 +692,9 @@ error_code sys_process_spawns_a_self2(ppu_thread& ppu, vm::ptr<u32> pid, u32 pri
 	sys_process.todo("sys_process_spawns_a_self2(pid=*0x%x, primary_prio=0x%x, flags=0x%llx, stack=*0x%x, stack_size=0x%x, mem_id=0x%x, param_sfo=*0x%x, dbg_data=*0x%x"
 		, pid, primary_prio, flags, stack, stack_size, mem_id, param_sfo, dbg_data);
 
-	// Pier currently runs one guest process. Support the XMB's installed-game
-	// launch as a process handoff, without pretending that a child PID exists.
+	// The XMB's installed-game launch. With the shared native console (Linux
+	// default) the game becomes a real child host and its PID is returned; the
+	// VSH-replacing single-process handoff below is offline diagnostics only.
 	// Other VSH helpers (e.g. background media workers) still follow the upstream
 	// path below; they must not replace the firmware process.
 #ifdef __linux__
