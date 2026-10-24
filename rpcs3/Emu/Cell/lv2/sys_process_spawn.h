@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <optional>
 #include <span>
@@ -52,6 +53,19 @@ namespace pier
 		if (result.argv.empty())
 			return std::nullopt;
 		return result;
+	}
+
+	// True in a Pier host that the shared native console spawned for a game the
+	// XMB launched. The supervisor gives exactly those hosts their guest token,
+	// and the console context refuses to start with a token it cannot claim, so
+	// the variable alone answers the question, even before the context exists.
+	inline bool is_native_game_child()
+	{
+#ifdef __linux__
+		return std::getenv("PIER_NATIVE_GUEST_TOKEN") != nullptr;
+#else
+		return false;
+#endif
 	}
 
 	// Exact guest argv/envp for a native child host, as hex of NUL-terminated

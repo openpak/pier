@@ -611,7 +611,7 @@ int run_rpcs3(int argc, char** argv)
 
 	// A game child of Pier's native console shares the firmware's caches (compiled
 	// code and shaders are reused across both); it keeps its own lock and log.
-	const bool native_game_child = std::getenv("PIER_NATIVE_GUEST_TOKEN") != nullptr;
+	const bool native_game_child = pier::is_native_game_child();
 	const std::string lock_name = fs::get_cache_dir() + (native_game_child ? "RPCS3-game.buf" : "RPCS3.buf");
 	const std::string log_name = fs::get_log_dir() + (native_game_child ? "RPCS3-game.log" : "RPCS3.log");
 

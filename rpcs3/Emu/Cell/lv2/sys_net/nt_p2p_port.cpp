@@ -1,5 +1,5 @@
 #include "stdafx.h"
-#include "Emu/Cell/lv2/native_console_runtime.h"
+#include "Emu/Cell/lv2/sys_process_spawn.h"
 #include "Emu/NP/ip_address.h"
 #include "nt_p2p_port.h"
 #include "lv2_socket_p2ps.h"
@@ -99,8 +99,7 @@ nt_p2p_port::nt_p2p_port(u16 port)
 	// use the address OpenPak's servers observe).
 	if (ret_bind == -1 && errno == EADDRINUSE)
 	{
-		const auto& context = g_fxo->get<pier::native_console_context>();
-		if (context.kernel && context.parent_pid)
+		if (pier::is_native_game_child())
 		{
 			::sockaddr_storage any{};
 			::socklen_t len = sizeof(::sockaddr_in);

@@ -21,6 +21,7 @@
 #include "Emu/Cell/SPURecompiler.h"
 #include "Emu/RSX/RSXThread.h"
 #include "Emu/Cell/lv2/sys_process.h"
+#include "Emu/Cell/lv2/sys_process_spawn.h"
 #include "Emu/Cell/lv2/sys_sync.h"
 #include "Emu/Cell/lv2/sys_prx.h"
 #include "Emu/Cell/lv2/sys_overlay.h"
@@ -1894,7 +1895,7 @@ game_boot_result Emulator::Load(const std::string& title_id, bool is_disc_patch,
 #ifdef __linux__
 			// A game spawned by VSH asks the firmware for network/PSN state over
 			// sysutil IPC, like a real PS3; the HLE versions answer "offline".
-			if (std::getenv("PIER_NATIVE_GUEST_ARGV"))
+			if (pier::is_native_game_child())
 			{
 				auto libs = g_cfg.core.libraries_control.get_set();
 				for (std::string lib : {"libsysutil.sprx", "libsysutil_np.sprx", "libsysutil_np2.sprx", "libnetctl.sprx"})
@@ -4337,7 +4338,7 @@ void Emulator::Kill(bool allow_autoexit, bool savestate, savestate_stage* save_s
 #ifdef __linux__
 			// A game child is done once its guest has stopped: caches are written as they
 			// compile, so skip the multi-second host teardown and let VSH's wait return now.
-			if (std::getenv("PIER_NATIVE_GUEST_ARGV"))
+			if (pier::is_native_game_child())
 			{
 				sys_log.notice("Native game child: guest stopped, exiting host");
 				logs::listener::sync_all();

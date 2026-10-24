@@ -354,13 +354,6 @@ error_code sys_process_wait_for_child(u32 pid, vm::ptr<u32> status, u64 unk)
 }
 
 #ifdef __linux__
-// A native guest child host exists only for its guest.
-static bool native_child_host()
-{
-	const auto& context = g_fxo->get<pier::native_console_context>();
-	return context.kernel && context.parent_pid;
-}
-
 static void quit_native_child_host()
 {
 	Emu.after_kill_callback = [] { Emu.Quit(true); };
@@ -441,7 +434,7 @@ void _sys_process_exit(ppu_thread& ppu, s32 status, u32 arg2, u32 arg3)
 		sys_process.success("Process finished");
 		signal_system_cache_can_stay();
 #ifdef __linux__
-		if (native_child_host())
+		if (pier::is_native_game_child())
 			return quit_native_child_host();
 #endif
 		Emu.Kill();
@@ -508,7 +501,7 @@ void lv2_exitspawn(ppu_thread& ppu, std::vector<std::string>& argv, std::vector<
 	const bool is_real_reboot = (ppu.gpr[11] == 379);
 
 #ifdef __linux__
-	if (native_child_host())
+	if (pier::is_native_game_child())
 	{
 		// Booting another title inside the child host would register a second
 		// guest; until the data returns through VSH's wait, end as a host failure.
@@ -673,7 +666,7 @@ void pier_native_diag_game()
 #ifdef __linux__
 	auto& context = g_fxo->get<pier::native_console_context>();
 	const char* game = std::getenv("PIER_NATIVE_DIAG_GAME");
-	if (!game || !context.kernel || context.parent_pid)
+	if (!game || !context.kernel || pier::is_native_game_child())
 		return;
 	// PIER_NATIVE_DIAG_DELAY=<seconds> separates child attach from VSH boot.
 	// ponytail: detached sleeper; a probe must outlive the delay or it touches a stopped emulator.

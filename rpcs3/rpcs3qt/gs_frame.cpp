@@ -16,6 +16,7 @@
 #include "Emu/Cell/Modules/cellScreenshot.h"
 #include "Emu/Cell/Modules/cellAudio.h"
 #include "Emu/Cell/lv2/sys_rsxaudio.h"
+#include "Emu/Cell/lv2/sys_process_spawn.h"
 #include "Emu/RSX/RSXThread.h"
 #include "Emu/RSX/Utils/image_utils.hpp"
 #include "Emu/RSX/Utils/rsx_utils.h"
@@ -124,7 +125,7 @@ gs_frame::gs_frame(QScreen* screen, const QRect& geometry, const QIcon& appIcon,
 #ifdef HAVE_X11
 	// Pier: like a PS3 swapping the XMB for the game, a native game child draws inside the
 	// firmware's window. X11 only: Wayland has no cross-process embedding, so run-pier.sh uses xcb.
-	if (QGuiApplication::platformName() == "xcb" && qEnvironmentVariableIsSet("PIER_NATIVE_GUEST_ARGV"))
+	if (QGuiApplication::platformName() == "xcb" && pier::is_native_game_child())
 	{
 		if (const WId host = qEnvironmentVariable("PIER_VSH_WINDOW").toULongLong())
 		{
@@ -153,7 +154,7 @@ gs_frame::gs_frame(QScreen* screen, const QRect& geometry, const QIcon& appIcon,
 	load_gui_settings();
 
 #ifdef HAVE_X11
-	if (!m_embedded && QGuiApplication::platformName() == "xcb" && !qEnvironmentVariableIsSet("PIER_NATIVE_GUEST_ARGV"))
+	if (!m_embedded && QGuiApplication::platformName() == "xcb" && !pier::is_native_game_child())
 	{
 		// Game children inherit this and embed themselves into the firmware's window.
 		qputenv("PIER_VSH_WINDOW", QByteArray::number(static_cast<qulonglong>(winId())));
@@ -1300,7 +1301,7 @@ bool gs_frame::event(QEvent* ev)
 			return true;
 		}
 	}
-	else if (ev->type() == QEvent::KeyPress && static_cast<QKeyEvent*>(ev)->key() == Qt::Key_F8 && qEnvironmentVariableIsSet("PIER_NATIVE_GUEST_ARGV"))
+	else if (ev->type() == QEvent::KeyPress && static_cast<QKeyEvent*>(ev)->key() == Qt::Key_F8 && pier::is_native_game_child())
 	{
 		// OpenPak's shared return-to-home key: quit the game; VSH's wait returns it to the XMB.
 		if (!Emu.IsStopped())
