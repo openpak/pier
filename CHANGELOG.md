@@ -3,7 +3,7 @@
 Only OpenPak's changes are listed; everything else is upstream RPCS3. `git log` stays the
 source of truth. `nightly` is a rolling pre-release.
 
-## Unreleased
+## v0.0.44 — 2026-11-04
 
 - OpenPak boot path: OpenPak DNS to the primary box, np-account terminates the firmware TLS
 - README for the fork; upstream merged as it moves (last 2026-10-24)
