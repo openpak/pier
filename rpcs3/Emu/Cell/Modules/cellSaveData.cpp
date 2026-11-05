@@ -2734,40 +2734,42 @@ void cellSysutil_SaveData_init()
 {
 	REG_VAR(cellSysutil, g_savedata_context).flag(MFF_HIDDEN);
 
-	// libsysutil functions:
-	REG_FUNC(cellSysutil, cellSaveDataGetEnableOverlay);
-	REG_FUNC(cellSysutil, cellSaveDataEnableOverlay);
+	// libsysutil functions. Pier: the native game child loads the firmware's libsysutil (LLE) for the network and
+	// NP state IPC, but the firmware's savedata path needs VSH's savedata plugin and a game/VSH call-back round trip that
+	// never completes (the plugin leaves an empty PARAM.SFO and unloads). Keep the savedata API on the HLE implementation.
+	REG_FUNC(cellSysutil, cellSaveDataGetEnableOverlay).flag(MFF_FORCED_HLE);
+	REG_FUNC(cellSysutil, cellSaveDataEnableOverlay).flag(MFF_FORCED_HLE);
 
-	REG_FUNC(cellSysutil, cellSaveDataDelete2);
-	REG_FUNC(cellSysutil, cellSaveDataDelete);
-	REG_FUNC(cellSysutil, cellSaveDataUserFixedDelete);
-	REG_FUNC(cellSysutil, cellSaveDataFixedDelete);
+	REG_FUNC(cellSysutil, cellSaveDataDelete2).flag(MFF_FORCED_HLE);
+	REG_FUNC(cellSysutil, cellSaveDataDelete).flag(MFF_FORCED_HLE);
+	REG_FUNC(cellSysutil, cellSaveDataUserFixedDelete).flag(MFF_FORCED_HLE);
+	REG_FUNC(cellSysutil, cellSaveDataFixedDelete).flag(MFF_FORCED_HLE);
 
-	REG_FUNC(cellSysutil, cellSaveDataUserFixedLoad);
-	REG_FUNC(cellSysutil, cellSaveDataUserFixedSave);
-	REG_FUNC(cellSysutil, cellSaveDataFixedLoad2);
-	REG_FUNC(cellSysutil, cellSaveDataFixedSave2);
-	REG_FUNC(cellSysutil, cellSaveDataFixedLoad);
-	REG_FUNC(cellSysutil, cellSaveDataFixedSave);
+	REG_FUNC(cellSysutil, cellSaveDataUserFixedLoad).flag(MFF_FORCED_HLE);
+	REG_FUNC(cellSysutil, cellSaveDataUserFixedSave).flag(MFF_FORCED_HLE);
+	REG_FUNC(cellSysutil, cellSaveDataFixedLoad2).flag(MFF_FORCED_HLE);
+	REG_FUNC(cellSysutil, cellSaveDataFixedSave2).flag(MFF_FORCED_HLE);
+	REG_FUNC(cellSysutil, cellSaveDataFixedLoad).flag(MFF_FORCED_HLE);
+	REG_FUNC(cellSysutil, cellSaveDataFixedSave).flag(MFF_FORCED_HLE);
 
-	REG_FUNC(cellSysutil, cellSaveDataUserListLoad);
-	REG_FUNC(cellSysutil, cellSaveDataUserListSave);
-	REG_FUNC(cellSysutil, cellSaveDataListLoad2);
-	REG_FUNC(cellSysutil, cellSaveDataListSave2);
-	REG_FUNC(cellSysutil, cellSaveDataListLoad);
-	REG_FUNC(cellSysutil, cellSaveDataListSave);
+	REG_FUNC(cellSysutil, cellSaveDataUserListLoad).flag(MFF_FORCED_HLE);
+	REG_FUNC(cellSysutil, cellSaveDataUserListSave).flag(MFF_FORCED_HLE);
+	REG_FUNC(cellSysutil, cellSaveDataListLoad2).flag(MFF_FORCED_HLE);
+	REG_FUNC(cellSysutil, cellSaveDataListSave2).flag(MFF_FORCED_HLE);
+	REG_FUNC(cellSysutil, cellSaveDataListLoad).flag(MFF_FORCED_HLE);
+	REG_FUNC(cellSysutil, cellSaveDataListSave).flag(MFF_FORCED_HLE);
 
-	REG_FUNC(cellSysutil, cellSaveDataUserListAutoLoad);
-	REG_FUNC(cellSysutil, cellSaveDataUserListAutoSave);
-	REG_FUNC(cellSysutil, cellSaveDataListAutoLoad);
-	REG_FUNC(cellSysutil, cellSaveDataListAutoSave);
+	REG_FUNC(cellSysutil, cellSaveDataUserListAutoLoad).flag(MFF_FORCED_HLE);
+	REG_FUNC(cellSysutil, cellSaveDataUserListAutoSave).flag(MFF_FORCED_HLE);
+	REG_FUNC(cellSysutil, cellSaveDataListAutoLoad).flag(MFF_FORCED_HLE);
+	REG_FUNC(cellSysutil, cellSaveDataListAutoSave).flag(MFF_FORCED_HLE);
 
-	REG_FUNC(cellSysutil, cellSaveDataUserAutoLoad);
-	REG_FUNC(cellSysutil, cellSaveDataUserAutoSave);
-	REG_FUNC(cellSysutil, cellSaveDataAutoLoad2);
-	REG_FUNC(cellSysutil, cellSaveDataAutoSave2);
-	REG_FUNC(cellSysutil, cellSaveDataAutoLoad);
-	REG_FUNC(cellSysutil, cellSaveDataAutoSave);
+	REG_FUNC(cellSysutil, cellSaveDataUserAutoLoad).flag(MFF_FORCED_HLE);
+	REG_FUNC(cellSysutil, cellSaveDataUserAutoSave).flag(MFF_FORCED_HLE);
+	REG_FUNC(cellSysutil, cellSaveDataAutoLoad2).flag(MFF_FORCED_HLE);
+	REG_FUNC(cellSysutil, cellSaveDataAutoSave2).flag(MFF_FORCED_HLE);
+	REG_FUNC(cellSysutil, cellSaveDataAutoLoad).flag(MFF_FORCED_HLE);
+	REG_FUNC(cellSysutil, cellSaveDataAutoSave).flag(MFF_FORCED_HLE);
 }
 
 DECLARE(ppu_module_manager::cellSaveData)("cellSaveData", []()
