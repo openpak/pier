@@ -734,14 +734,30 @@ s32 lv2_socket_native::setsockopt(s32 level, s32 optname, const std::vector<u8>&
 			native_val = &native_timeo;
 			native_len = sizeof(native_timeo);
 
-			const int tv_sec = ::narrow<int>(reinterpret_cast<const sys_net_timeval*>(optval.data())->tv_sec);
-			const int tv_usec = ::narrow<int>(reinterpret_cast<const sys_net_timeval*>(optval.data())->tv_usec);
+			s64 tv_sec = reinterpret_cast<const sys_net_timeval*>(optval.data())->tv_sec;
+			s64 tv_usec = reinterpret_cast<const sys_net_timeval*>(optval.data())->tv_usec;
+			// The firmware's Matching2 UDP sockets pass a tv_usec of one second or more; Linux refuses that
+			// with EDOM (which convert_error treats as fatal). Carry the excess into the seconds, like the
+			// PS3 kernel's timeval arithmetic does.
+			if (tv_usec < 0 || tv_usec >= 1000000)
+			{
+				tv_sec += tv_usec / 1000000;
+				tv_usec %= 1000000;
+				if (tv_usec < 0)
+				{
+					tv_usec += 1000000;
+					tv_sec--;
+				}
+			}
+			if (tv_sec < 0)
+				tv_sec = tv_usec = 0;
+			tv_sec = std::min<s64>(tv_sec, 0x7fffffff);
 #ifdef _WIN32
-			native_timeo = tv_sec * 1000;
-			native_timeo += tv_usec / 1000;
+			native_timeo = static_cast<int>(tv_sec * 1000);
+			native_timeo += static_cast<int>(tv_usec / 1000);
 #else
-			native_timeo.tv_sec = tv_sec;
-			native_timeo.tv_usec = tv_usec;
+			native_timeo.tv_sec = static_cast<decltype(native_timeo.tv_sec)>(tv_sec);
+			native_timeo.tv_usec = static_cast<decltype(native_timeo.tv_usec)>(tv_usec);
 #endif
 			// TODO: Overflow detection?
 			(optname == SYS_NET_SO_SNDTIMEO ? so_sendtimeo : so_rcvtimeo) = tv_usec + tv_sec * 1000000;
