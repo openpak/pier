@@ -1453,12 +1453,16 @@ namespace rsx
 			rsx::method_registers.surface_dma(2),
 			rsx::method_registers.surface_dma(3),
 		};
+		// Pier: pass a nonzero size so unknown DMA contexts (VSH in game mode
+		// leaves 0xcafe011f in surface_dma) warn and return 0 instead of
+		// emergency-exiting the whole emulation. Valid surfaces resolve
+		// identically; the layout reader below treats 0 as invalid.
 		return
 		{
-			rsx::get_address(offset_color[0], context_dma_color[0]),
-			rsx::get_address(offset_color[1], context_dma_color[1]),
-			rsx::get_address(offset_color[2], context_dma_color[2]),
-			rsx::get_address(offset_color[3], context_dma_color[3]),
+			rsx::get_address(offset_color[0], context_dma_color[0], 1),
+			rsx::get_address(offset_color[1], context_dma_color[1], 1),
+			rsx::get_address(offset_color[2], context_dma_color[2], 1),
+			rsx::get_address(offset_color[3], context_dma_color[3], 1),
 		};
 	}
 
@@ -1466,7 +1470,8 @@ namespace rsx
 	{
 		u32 m_context_dma_z = rsx::method_registers.surface_z_dma();
 		u32 offset_zeta = rsx::method_registers.surface_z_offset();
-		return rsx::get_address(offset_zeta, m_context_dma_z);
+		// Pier: nonzero size for the same graceful recovery as above.
+		return rsx::get_address(offset_zeta, m_context_dma_z, 1);
 	}
 
 	void thread::get_framebuffer_layout(rsx::framebuffer_creation_context context, framebuffer_layout &layout)
@@ -1492,6 +1497,15 @@ namespace rsx
 
 		layout.color_addresses = get_color_surface_addresses();
 		layout.zeta_address = get_zeta_surface_address();
+		if (!layout.color_addresses[0] || !layout.color_addresses[1] ||
+			!layout.color_addresses[2] || !layout.color_addresses[3] || !layout.zeta_address)
+		{
+			// Pier: a surface DMA lookup above failed gracefully (see above).
+			// Valid resolutions never return 0. Skip this update; the render
+			// target prep below is bypassed while rtt_config_valid is clear.
+			rsx_log.error("Invalid surface DMA context, skipping framebuffer update");
+			return;
+		}
 		layout.zeta_pitch = rsx::method_registers.surface_z_pitch();
 		layout.color_pitch =
 		{
