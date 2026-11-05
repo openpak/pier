@@ -3424,6 +3424,26 @@ static void ppu_check(ppu_thread& ppu, u64 addr)
 	}
 }
 
+// Pier: log the argument registers and the first bytes behind r3..r5 when they point into guest memory.
+static void pier_ppu_trace(ppu_thread* ppu, u64 addr)
+{
+	std::string line = fmt::format("PierTrace 0x%x lr=0x%x", addr, static_cast<u32>(ppu->lr));
+	for (u32 i = 3; i <= 10; i++)
+		fmt::append(line, " r%u=0x%llx", i, ppu->gpr[i]);
+	ppu_log.error("%s", line);
+	for (u32 i = 3; i <= 5; i++)
+	{
+		const u64 v = ppu->gpr[i];
+		if (v >= 0x10000 && v < 0xffff0000 && vm::check_addr(static_cast<u32>(v), vm::page_readable, 64))
+		{
+			std::string hex;
+			for (u32 b = 0; b < 64; b++)
+				fmt::append(hex, "%02x", *vm::get_super_ptr<u8>(static_cast<u32>(v) + b));
+			ppu_log.error("PierTrace 0x%x *r%u: %s", addr, i, hex);
+		}
+	}
+}
+
 static void ppu_trace(u64 addr)
 {
 	ppu_log.notice("Trace: 0x%llx", addr);
@@ -4979,6 +4999,7 @@ bool ppu_initialize(const ppu_module<lv2_obj>& info, bool check_only, u64 file_s
 			{ "__error", reinterpret_cast<u64>(&ppu_error) },
 			{ "__check", reinterpret_cast<u64>(&ppu_check) },
 			{ "__trace", reinterpret_cast<u64>(&ppu_trace) },
+			{ "__pier_trace", reinterpret_cast<u64>(&pier_ppu_trace) },
 			{ "__syscall", reinterpret_cast<u64>(ppu_execute_syscall) },
 			{ "__get_tb", reinterpret_cast<u64>(get_timebased_time) },
 			{ "__lwarx", reinterpret_cast<u64>(ppu_lwarx) },

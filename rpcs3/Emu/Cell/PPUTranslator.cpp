@@ -28,6 +28,35 @@ const ppu_decoder<PPUTranslator> s_ppu_decoder;
 extern const ppu_decoder<ppu_itype> g_ppu_itype;
 extern const ppu_decoder<ppu_iname> g_ppu_iname;
 
+#include <cstdlib>
+#include <cstring>
+#include <set>
+
+// Pier: addresses (from the environment) whose function entry is traced. Parsed once.
+bool pier_ppu_trace_wanted(u64 addr)
+{
+	static const std::set<u64> addrs = []
+	{
+		std::set<u64> out;
+		if (const char* v = std::getenv("PIER_PPU_TRACE"))
+		{
+			for (const char* p = v; *p;)
+			{
+				char* end = nullptr;
+				const u64 a = std::strtoull(p, &end, 0);
+				if (end == p)
+					break;
+				out.insert(a);
+				p = end;
+				while (*p == ',' || *p == ' ')
+					p++;
+			}
+		}
+		return out;
+	}();
+	return !addrs.empty() && addrs.count(addr);
+}
+
 PPUTranslator::PPUTranslator(LLVMContext& context, Module* _module, const ppu_module<lv2_obj>& info, ExecutionEngine& engine)
 	: cpu_translator(_module, false)
 	, m_info(info)
@@ -241,6 +270,11 @@ Function* PPUTranslator::Translate(const ppu_function& info)
 	const auto body = BasicBlock::Create(m_context, "__body", m_function);
 
 	//Call(GetType<void>(), "__trace", GetAddr());
+	if (pier_ppu_trace_wanted(m_addr))
+	{
+		// Pier diagnostic: PIER_PPU_TRACE="0x29ad90,..." logs the arguments at the entry of those functions.
+		Call(GetType<void>(), "__pier_trace", m_thread, GetAddr());
+	}
 	if (need_check)
 	{
 		// Check status register in the entry block

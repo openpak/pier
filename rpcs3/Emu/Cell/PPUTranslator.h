@@ -13,6 +13,8 @@ struct ppu_module;
 
 struct lv2_obj;
 
+bool pier_ppu_trace_wanted(u64 addr);
+
 class PPUTranslator final : public cpu_translator
 {
 	// PPU Module
