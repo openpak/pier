@@ -31,5 +31,13 @@ namespace np
 		shared_mutex mutex;
 		std::unordered_map<s32, std::queue<std::vector<u8>>> m_dns_spylist;
 		std::vector<std::pair<std::string, u32>> m_redirs;
+
+		// Pier: OpenPak DNS catcher (ps3-patcher v0.2.17 parity). When PIER_DNS_CATCHER names a list
+		// file, the signed-list matcher in Emu/NP/openpak_catcher.h decides each lookup: a matching
+		// name is answered with the box address here, every other name is passed to the configured
+		// DNS server untouched (so plain upstream DNS resolves the owner's own network). Caught names
+		// are logged, passed names only counted.
+		bool m_catcher = false;
+		u32 m_catcher_passed = 0;
 	};
 } // namespace np

@@ -6,6 +6,14 @@
 #include "util/logs.hpp"
 
 #include <regex>
+#include <cstdlib>
+#include <cstdio>
+#include <fstream>
+
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wold-style-cast"
+#include "Emu/NP/openpak_catcher.h"
+#pragma GCC diagnostic pop
 
 #ifdef _WIN32
 #include <WS2tcpip.h>
@@ -22,11 +30,49 @@
 #endif
 
 LOG_CHANNEL(dnshook_log, "DnsHook");
+LOG_CHANNEL(catcher_log, "DnsCatcher");
+
+static catcher_list s_catch_list{};
 
 namespace np
 {
 	dnshook::dnshook()
 	{
+		// Pier: load the OpenPak catcher list (PIER_DNS_CATCHER) instead of the RPCN swap list.
+		if (const char* path = std::getenv("PIER_DNS_CATCHER"))
+		{
+			std::ifstream f(path);
+			std::string kind, value;
+			catcher_list l{};
+			while (f >> kind >> value)
+			{
+				if (kind == "ip")
+				{
+					unsigned a, b, c, d;
+					if (std::sscanf(value.c_str(), "%u.%u.%u.%u", &a, &b, &c, &d) == 4)
+					{
+						l.ip[0] = static_cast<u8>(a); l.ip[1] = static_cast<u8>(b);
+						l.ip[2] = static_cast<u8>(c); l.ip[3] = static_cast<u8>(d);
+					}
+				}
+				else
+				{
+					const int k = kind == "family" ? CATCHER_FAMILY : kind == "exact" ? CATCHER_EXACT : kind == "never" ? CATCHER_NEVER : -1;
+					if (k < 0 || !catcher_add(&l, k, value.c_str(), static_cast<int>(value.size())))
+						catcher_log.error("list entry refused: %s %s", kind, value);
+				}
+			}
+			if (l.n && l.ip[0])
+			{
+				s_catch_list = l;
+				m_catcher = true;
+				catcher_log.success("catcher on: %d families, answer %u.%u.%u.%u (every other name goes to the configured DNS)", l.n, l.ip[0], l.ip[1], l.ip[2], l.ip[3]);
+				for (int i = 0; i < l.n; i++)
+					catcher_log.notice("entry %d: %s %s", i, l.kind[i] == CATCHER_FAMILY ? "family" : l.kind[i] == CATCHER_EXACT ? "exact" : "never", l.name[i]);
+				return;
+			}
+			catcher_log.error("list %s missing or empty: catcher off, using the swap list", path);
+		}
 		// Init switch map for dns
 		const std::string swap_list = g_cfg.net.swap_list.to_string();
 		const auto swaps = fmt::split_sv(swap_list, {"&&"});
@@ -86,6 +132,21 @@ namespace np
 
 	std::optional<u32> dnshook::get_redir(const std::string& hostname)
 	{
+		if (m_catcher)
+		{
+			const int hit = catcher_match(&s_catch_list, hostname.c_str());
+			if (hit < 0)
+			{
+				m_catcher_passed++;
+				catcher_log.warning("passed %s to the configured DNS (%u passed so far)", hostname, m_catcher_passed);
+				return std::nullopt;
+			}
+			u32 ip;
+			std::memcpy(&ip, s_catch_list.ip, 4);
+			catcher_log.success("caught %s (family %s) -> %u.%u.%u.%u", hostname, s_catch_list.name[hit], s_catch_list.ip[0], s_catch_list.ip[1], s_catch_list.ip[2], s_catch_list.ip[3]);
+			return ip;
+		}
+
 		for (const auto& [pattern, ip] : m_redirs)
 		{
 			const std::regex regex_pattern(fmt::replace_all(pattern, {{".", "\\."}, {"*", ".*"}}), std::regex_constants::icase);
