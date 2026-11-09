@@ -356,14 +356,8 @@ std::optional<s32> lv2_socket_p2p::sendto(s32 flags, const std::vector<u8>& buf,
 		return {-SYS_NET_EACCES};
 	}
 
-	std::vector<u8> p2p_data(buf.size() + VPORT_P2P_HEADER_SIZE);
-	const le_t<u16> p2p_vport_le = p2p_vport;
-	const le_t<u16> src_vport_le = vport;
-	const le_t<u16> p2p_flags_le = P2P_FLAG_P2P;
-	memcpy(p2p_data.data(), &p2p_vport_le, sizeof(u16));
-	memcpy(p2p_data.data() + sizeof(u16), &src_vport_le, sizeof(u16));
-	memcpy(p2p_data.data() + sizeof(u16) + sizeof(u16), &p2p_flags_le, sizeof(u16));
-	memcpy(p2p_data.data() + VPORT_P2P_HEADER_SIZE, buf.data(), buf.size());
+	const auto p2p_data = udpp2p::frame(vport, p2p_vport, buf.data(), buf.size());
+	const s32 header_size = ::size32(p2p_data) - ::size32(buf);
 
 	int native_flags = 0;
 	if (flags & SYS_NET_MSG_WAITALL)
@@ -371,11 +365,11 @@ std::optional<s32> lv2_socket_p2p::sendto(s32 flags, const std::vector<u8>& buf,
 		native_flags |= MSG_WAITALL;
 	}
 
-	auto native_result = np::sendto_possibly_ipv6(native_socket, reinterpret_cast<const char*>(p2p_data.data()), ::size32(p2p_data), &native_addr, native_flags);
+	auto native_result = udpp2p::send(native_socket, port, p2p_data, native_addr, native_flags);
 
 	if (native_result >= 0)
 	{
-		return {std::max<s32>(native_result - VPORT_P2P_HEADER_SIZE, 0l)};
+		return {std::max<s32>(native_result - header_size, 0)};
 	}
 
 	s32 result = get_last_error(!so_nbio && (flags & SYS_NET_MSG_DONTWAIT) == 0);

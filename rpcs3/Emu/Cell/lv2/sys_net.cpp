@@ -31,6 +31,7 @@
 #endif
 
 #include "Emu/NP/np_handler.h"
+#include "Emu/NP/np_helpers.h"
 #include "Emu/Cell/Modules/cellNetCtl.h"
 #include "Emu/NP/np_helpers.h"
 #include "Emu/Cell/timers.hpp"
@@ -2411,6 +2412,19 @@ error_code sys_net_bnet_ioctl(ppu_thread& ppu, s32 arg1, u32 arg2, vm::ptr<void>
 		return CELL_OK;
 	}
 	default: break;
+	}
+
+	// UDPP2P ioctls (lv2 4.93 FUN_00160c80): 0x800250cf sets the P2P alias port (u16) and
+	// 0xc00250d0 reads it; 0x802450cb adds and 0x802450cc removes a keyed peer context (port @+2,
+	// IPv4 @+4, 16-byte key @+0x10) that kinds 4-6 need. Only the alias and the peer are logged.
+	if ((arg2 & 0xff00) == 0x5000 && arg3)
+	{
+		const auto p = vm::_ptr<const u8>(arg3.addr());
+		if (arg2 == 0x800250cf)
+			sys_net.warning("[UDPP2P] ioctl(%d): set alias port %d (not implemented)", arg1, read_from_ptr_unsafe<be_t<u16>>(p));
+		else if (arg2 == 0x802450cb || arg2 == 0x802450cc)
+			sys_net.warning("[UDPP2P] ioctl(%d): %s keyed peer %s:%d (not implemented)", arg1, arg2 == 0x802450cb ? "add" : "remove",
+				np::ip_to_string(read_from_ptr_unsafe<u32>(p, 4)), read_from_ptr_unsafe<be_t<u16>>(p, 2));
 	}
 
 	sys_net.todo("sys_net_bnet_ioctl(%d, 0x%x, *0x%x)", arg1, arg2, arg3);

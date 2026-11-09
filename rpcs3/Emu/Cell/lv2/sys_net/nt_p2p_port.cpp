@@ -12,6 +12,50 @@
 
 LOG_CHANNEL(sys_net);
 
+namespace
+{
+	// Loopback relay between VSH and a native game child: "PIRL", peer IPv4, peer port (both
+	// network order), then the datagram. Child -> VSH: send it to the peer from VSH's port.
+	// VSH -> child: it arrived from the peer for a vport bound in the child.
+	constexpr std::array<u8, 4> relay_magic{'P', 'I', 'R', 'L'};
+	constexpr usz relay_header_size = 4 + 4 + 2;
+
+	// Set in a native game child whose P2P port is VSH's (written once, before s_relay_port).
+	atomic_t<u16> s_relay_port = 0;
+	::sockaddr_in s_vsh_relay_addr{};
+
+	std::vector<u8> relay_wrap(u32 ip_be, u16 port_be, const u8* data, usz size)
+	{
+		std::vector<u8> out(relay_header_size + size);
+		std::memcpy(out.data(), relay_magic.data(), relay_magic.size());
+		std::memcpy(out.data() + 4, &ip_be, 4);
+		std::memcpy(out.data() + 8, &port_be, 2);
+		if (size)
+			std::memcpy(out.data() + relay_header_size, data, size);
+		return out;
+	}
+
+	bool is_loopback(const ::sockaddr_storage& addr)
+	{
+		return addr.ss_family == AF_INET && (std::bit_cast<be_t<u32>>(reinterpret_cast<const ::sockaddr_in&>(addr).sin_addr.s_addr) >> 24) == 127;
+	}
+} // namespace
+
+namespace udpp2p
+{
+	s32 send(socket_type s, u16 port, const std::vector<u8>& packet, const ::sockaddr_in& dst, int native_flags)
+	{
+		if (port && s_relay_port == port)
+		{
+			const auto wrapped = relay_wrap(dst.sin_addr.s_addr, dst.sin_port, packet.data(), packet.size());
+			const s32 res = np::sendto_possibly_ipv6(s, reinterpret_cast<const char*>(wrapped.data()), ::size32(wrapped), &s_vsh_relay_addr, native_flags);
+			return res < 0 ? res : std::max<s32>(res - static_cast<s32>(relay_header_size), 0);
+		}
+
+		return np::sendto_possibly_ipv6(s, reinterpret_cast<const char*>(packet.data()), ::size32(packet), &dst, native_flags);
+	}
+} // namespace udpp2p
+
 namespace sys_net_helpers
 {
 	bool all_reusable(const std::set<s32>& sock_ids)
@@ -116,7 +160,16 @@ nt_p2p_port::nt_p2p_port(u16 port)
 			{
 				::getsockname(p2p_socket, reinterpret_cast<sockaddr*>(&any), &len);
 				const u16 host_port = is_ipv6 ? reinterpret_cast<::sockaddr_in6&>(any).sin6_port : reinterpret_cast<::sockaddr_in&>(any).sin_port;
-				sys_net.warning("P2P port %d is VSH's on this host; this game child uses host port %d", port, std::bit_cast<be_t<u16>>(host_port).value());
+				sys_net.warning("P2P port %d is VSH's on this host; this game child relays through it from host port %d", port, std::bit_cast<be_t<u16>>(host_port).value());
+
+				const u32 vsh_ip = nph.get_bind_ip();
+				s_vsh_relay_addr = {.sin_family = AF_INET, .sin_port = be_port};
+				s_vsh_relay_addr.sin_addr.s_addr = vsh_ip ? vsh_ip : std::bit_cast<u32>(be_t<u32>{0x7f000001});
+				s_relay_port = port;
+
+				// Announce this child, so VSH forwards what arrives for the vports bound here.
+				const auto hello = relay_wrap(0, 0, nullptr, 0);
+				np::sendto_possibly_ipv6(p2p_socket, reinterpret_cast<const char*>(hello.data()), ::size32(hello), &s_vsh_relay_addr, 0);
 				return;
 			}
 		}
@@ -186,6 +239,52 @@ bool nt_p2p_port::handle_listening(s32 sock_id, p2ps_encapsulated_tcp* tcp_heade
 	return sock_p2ps.handle_listening(tcp_header, data, op_addr);
 }
 
+bool nt_p2p_port::deliver_dgram(u16 dst_vport, u16 src_vport, const ::sockaddr_storage& from, std::vector<u8> data)
+{
+	std::lock_guard lock(bound_p2p_vports_mutex);
+	if (!bound_p2p_vports.contains(dst_vport))
+		return false;
+
+	const auto& from4 = reinterpret_cast<const struct sockaddr_in&>(from);
+	sys_net_sockaddr_in_p2p p2p_addr{};
+	p2p_addr.sin_len    = sizeof(sys_net_sockaddr_in);
+	p2p_addr.sin_family = SYS_NET_AF_INET;
+	p2p_addr.sin_addr   = std::bit_cast<be_t<u32>, u32>(from4.sin_addr.s_addr);
+	p2p_addr.sin_vport  = src_vport;
+	p2p_addr.sin_port   = std::bit_cast<be_t<u16>, u16>(from4.sin_port);
+
+	auto& bound_sockets = ::at32(bound_p2p_vports, dst_vport);
+
+	for (auto it = bound_sockets.begin(); it != bound_sockets.end();)
+	{
+		s32 sock_id = *it;
+		const auto sock = idm::check<lv2_socket>(sock_id, [&](lv2_socket& sock)
+			{
+				ensure(sock.get_type() == SYS_NET_SOCK_DGRAM_P2P);
+				auto& sock_p2p = reinterpret_cast<lv2_socket_p2p&>(sock);
+
+				sock_p2p.handle_new_data(p2p_addr, data);
+			});
+
+		if (!sock)
+		{
+			sys_net.error("Socket %d found in bound_p2p_vports didn't exist!", sock_id);
+			it = bound_sockets.erase(it);
+			if (bound_sockets.empty())
+			{
+				bound_p2p_vports.erase(dst_vport);
+				break;
+			}
+		}
+		else
+		{
+			it++;
+		}
+	}
+
+	return true;
+}
+
 bool nt_p2p_port::recv_data()
 {
 	::sockaddr_storage native_addr{};
@@ -207,8 +306,6 @@ bool nt_p2p_port::recv_data()
 		return true;
 	}
 
-	u16 dst_vport = reinterpret_cast<le_t<u16>&>(p2p_recv_data[0]);
-
 	if (np::is_ipv6_supported())
 	{
 		const auto* addr_ipv6 = reinterpret_cast<sockaddr_in6*>(&native_addr);
@@ -216,6 +313,62 @@ bool nt_p2p_port::recv_data()
 		native_addr = {};
 		std::memcpy(&native_addr, &addr_ipv4, sizeof(addr_ipv4));
 	}
+
+	const u8* data = p2p_recv_data.data();
+	usz size = recv_res;
+	bool relayed = false;
+
+	if (size >= relay_header_size && is_loopback(native_addr) && std::memcmp(data, relay_magic.data(), relay_magic.size()) == 0)
+	{
+		::sockaddr_in peer{.sin_family = AF_INET};
+		std::memcpy(&peer.sin_addr.s_addr, data + 4, 4);
+		std::memcpy(&peer.sin_port, data + 8, 2);
+		data += relay_header_size;
+		size -= relay_header_size;
+
+		if (s_relay_port != port)
+		{
+			// VSH side: the game child sends this datagram from the console's port.
+			child_relay = native_addr;
+			if (peer.sin_port && size && np::sendto_possibly_ipv6(p2p_socket, reinterpret_cast<const char*>(data), static_cast<u32>(size), &peer, 0) == -1)
+				sys_net.error("[UDPP2P] Relaying a game child's datagram to %s:%d failed: %d", np::ip_to_string(peer.sin_addr.s_addr), std::bit_cast<be_t<u16>>(peer.sin_port).value(), get_last_error(false));
+			return true;
+		}
+
+		// Game child side: VSH received it from `peer` for a vport bound here.
+		native_addr = {};
+		std::memcpy(&native_addr, &peer, sizeof(peer));
+		relayed = true;
+	}
+
+	if (const auto hdr = udpp2p::parse(data, size))
+	{
+		const auto& from = reinterpret_cast<const ::sockaddr_in&>(native_addr);
+
+		if (hdr->kind != udpp2p::kind_plain)
+		{
+			sys_net.warning("[UDPP2P] Dropped a kind %d datagram (%d bytes) from %s:%d: keyed and unreachable kinds are not implemented", hdr->kind, size, np::ip_to_string(from.sin_addr.s_addr), std::bit_cast<be_t<u16>>(from.sin_port).value());
+			return true;
+		}
+
+		if (deliver_dgram(hdr->dst_vport, hdr->src_vport, native_addr, std::vector<u8>(data + hdr->size, data + size)))
+			return true;
+
+		if (child_relay && !relayed)
+		{
+			const auto wrapped = relay_wrap(from.sin_addr.s_addr, from.sin_port, data, size);
+			np::sendto_possibly_ipv6(p2p_socket, reinterpret_cast<const char*>(wrapped.data()), ::size32(wrapped), reinterpret_cast<const ::sockaddr_in*>(&*child_relay), 0);
+			return true;
+		}
+
+		sys_net.notice("[UDPP2P] Datagram for unbound vport %d from %s:%d", hdr->dst_vport, np::ip_to_string(from.sin_addr.s_addr), std::bit_cast<be_t<u16>>(from.sin_port).value());
+		return true;
+	}
+
+	if (relayed)
+		return true;
+
+	u16 dst_vport = reinterpret_cast<le_t<u16>&>(p2p_recv_data[0]);
 
 	if (dst_vport == 0)
 	{
@@ -273,48 +426,8 @@ bool nt_p2p_port::recv_data()
 
 	if (vport_flags & P2P_FLAG_P2P)
 	{
-		std::lock_guard lock(bound_p2p_vports_mutex);
-		if (bound_p2p_vports.contains(dst_vport))
-		{
-			sys_net_sockaddr_in_p2p p2p_addr{};
-
-			p2p_addr.sin_len    = sizeof(sys_net_sockaddr_in);
-			p2p_addr.sin_family = SYS_NET_AF_INET;
-			p2p_addr.sin_addr   = std::bit_cast<be_t<u32>, u32>(reinterpret_cast<struct sockaddr_in*>(&native_addr)->sin_addr.s_addr);
-			p2p_addr.sin_vport  = src_vport;
-			p2p_addr.sin_port   = std::bit_cast<be_t<u16>, u16>(reinterpret_cast<struct sockaddr_in*>(&native_addr)->sin_port);
-
-			auto& bound_sockets = ::at32(bound_p2p_vports, dst_vport);
-
-			for (auto it = bound_sockets.begin(); it != bound_sockets.end();)
-			{
-				s32 sock_id = *it;
-				const auto sock = idm::check<lv2_socket>(sock_id, [&](lv2_socket& sock)
-					{
-						ensure(sock.get_type() == SYS_NET_SOCK_DGRAM_P2P);
-						auto& sock_p2p = reinterpret_cast<lv2_socket_p2p&>(sock);
-
-						sock_p2p.handle_new_data(p2p_addr, p2p_data);
-					});
-
-				if (!sock)
-				{
-					sys_net.error("Socket %d found in bound_p2p_vports didn't exist!", sock_id);
-					it = bound_sockets.erase(it);
-					if (bound_sockets.empty())
-					{
-						bound_p2p_vports.erase(dst_vport);
-						break;
-					}
-				}
-				else
-				{
-					it++;
-				}
-			}
-
+		if (deliver_dgram(dst_vport, src_vport, native_addr, std::move(p2p_data)))
 			return true;
-		}
 	}
 	else if (vport_flags & P2P_FLAG_P2PS)
 	{

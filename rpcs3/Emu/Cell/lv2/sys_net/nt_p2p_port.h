@@ -29,6 +29,15 @@ enum VPORT_P2P_FLAGS
 	P2P_FLAG_P2PS = 1 << 1,
 };
 
+#include "udpp2p.h"
+
+namespace udpp2p
+{
+	// Sends one datagram from host P2P port `port`; in a native game child that port is
+	// VSH's, so the packet goes out through VSH's socket (see nt_p2p_port::child_relay).
+	s32 send(socket_type s, u16 port, const std::vector<u8>& packet, const ::sockaddr_in& dst, int native_flags);
+} // namespace udpp2p
+
 struct signaling_message
 {
 	u32 src_addr = 0;
@@ -67,6 +76,14 @@ struct nt_p2p_port
 	std::vector<signaling_message> sign_msgs{};
 
 	std::array<u8, 65535> p2p_recv_data{};
+
+	// Native console (Linux): VSH owns the host's UDP port and a game child shares it through
+	// a loopback relay, so guest P2P packets leave from 3658 as on one real PS3. On VSH's side
+	// this is the child's loopback address, learned from the child's first relayed packet.
+	std::optional<::sockaddr_storage> child_relay;
+
+	// Hands a received DGRAM_P2P payload to the sockets bound to `dst_vport`.
+	bool deliver_dgram(u16 dst_vport, u16 src_vport, const ::sockaddr_storage& from, std::vector<u8> data);
 
 	nt_p2p_port(u16 port);
 	~nt_p2p_port();

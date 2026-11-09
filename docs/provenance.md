@@ -62,7 +62,9 @@ Shared state lets several Pier processes act as one console:
   stops. On X11 it draws inside the firmware's window, and F8 quits back to the
   XMB.
 - `sys_net/nt_p2p_port.cpp`. A child host binds an ephemeral host port when VSH
-  already holds the P2P port.
+  already holds the P2P port, and sends and receives its P2P datagrams through
+  VSH's port over a loopback relay, so the console uses one UDP 3658 like a real
+  PS3.
 
 ### Firmware boot
 
@@ -104,11 +106,30 @@ Shared state lets several Pier processes act as one console:
   the SDK (64-byte entries, joined-session pointer at offset 56), and the
   unimplemented `GetUserInfoList` reports unavailable.
 
+### Peer to peer (UDPP2P)
+
+Games and the firmware's own NP signaling already run as firmware code in Pier
+(libsysutil_np and librudp are loaded from the console's flash), so the only
+emulated layer is the kernel's P2P socket.
+
+- `sys_net/udpp2p.h`, `sys_net/lv2_socket_p2p.cpp`, `sys_net/nt_p2p_port.*`.
+  DGRAM_P2P datagrams use the console kernel's framing instead of RPCS3's own:
+  `0xff`, `0x80 | kind` (plus `0x40` when both virtual ports are below 0x100),
+  the source virtual port, then the destination virtual port (one byte each in
+  the compact form, otherwise big-endian 16-bit), then the payload. Kind 3 is
+  plain data. Kinds 4 to 6 (keyed peers) and 7 to 10 (unreachable replies) are
+  recognised and dropped with a warning. RPCS3's own framing is still accepted
+  for its stream sockets. The firmware's signaling socket is port 3658,
+  virtual port 0xfffe.
+- `sys_net.cpp`. The P2P ioctls that set the alias port and add or remove a
+  keyed peer are logged (peer address only, never the key); they are not
+  implemented.
+
 ### Tests, build and docs
 
 - `scripts/tests/pier_*.cpp`. Standalone regressions for the spawn-argument
-  codec, server-list copy and the native console memory, sync, events and
-  processes, built with a plain C++20 compiler outside the emulator build.
+  codec, server-list copy, the UDPP2P framing and the native console memory,
+  sync, events and processes, built with a plain C++20 compiler outside the emulator build.
 - `.github/workflows/nightly.yml`. A rolling `nightly` pre-release, built only
   when the source changed.
 - `README.md`, `docs/provenance.md`. Pier's documentation.
